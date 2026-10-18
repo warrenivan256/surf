@@ -174,12 +174,16 @@
     const userId = window.surfCurrentUserId;
     if (!userId) return;
     try {
-      const [{ data: relations, error: relationError }, { data: groupRows, error: groupError }] = await Promise.all([
+      const [{ data: relations, error: relationError }, { data: membershipsForUser, error: memberGroupsError }] = await Promise.all([
         db.from('friend_requests').select('id,requester_id,addressee_id,status,created_at,updated_at').or(`requester_id.eq.${userId},addressee_id.eq.${userId}`),
-        db.from('group_conversations').select('id,name,bio,avatar_path,owner_id,created_at').order('created_at', { ascending: false })
+        db.from('group_members').select('group_id,role').eq('user_id', userId)
       ]);
       if (relationError) throw relationError;
+      if (memberGroupsError) throw memberGroupsError;
+      const memberGroupIds = (membershipsForUser || []).map((m) => m.group_id);
+      const { data: groupRows, error: groupError } = await db.from('group_conversations').select('id,name,bio,avatar_path,owner_id,created_at').order('created_at', { ascending: false });
       if (groupError) throw groupError;
+      const visibleGroupIds = new Set([...(groupRows || []).filter(g => g.owner_id === userId).map(g => g.id), ...memberGroupIds]);
       const ownedGroups = (groupRows || []).filter((group) => group.owner_id === userId);
       if (ownedGroups.length) {
         const { error: ownerMembershipError } = await db.from('group_members').upsert(
@@ -205,7 +209,7 @@
           return { ...byId.get(personId), relation };
         }).filter((person) => person.id);
       } else friends = [];
-      groups = groupRows || [];
+      groups = (groupRows || []).filter(group => visibleGroupIds.has(group.id));
       const { data: ownReceiptSetting, error: receiptSettingError } = await db.from('profiles').select('read_receipts_enabled').eq('id', userId).maybeSingle();
       if (receiptSettingError) throw receiptSettingError;
       if (ownReceiptSetting) {
@@ -360,19 +364,42 @@
 
   async function selectLiveGroup(row, group) {
     document.querySelectorAll('#chatList .person').forEach((item) => item.classList.remove('selected'));
-    row.classList.add('selected'); window.surfActiveRecipientId = null; window.surfActiveGroupId = group.id;
+    row.classList.add('selected');
+    window.surfActiveRecipientId = null;
+    window.surfActiveGroupId = group.id;
     window.surfActiveGroup = group;
-    document.getElementById('chatName').textContent = group.name;
-    document.getElementById('chatAvatar').textContent = 'G'; document.getElementById('chatAvatar').style.backgroundImage = ''; document.getElementById('chatAvatar').style.display = 'grid';
-    document.getElementById('chatStatus').textContent = 'Group conversation';
-    updateChatPresence(null);
+    const nameNode = document.getElementById('chatName'); if (nameNode) nameNode.textContent = group.name || 'Group';
+    const avatarNodeEl = document.getElementById('chatAvatar');
+    if (avatarNodeEl) {
+      avatarNodeEl.textContent = group.avatar_path ? '' : (group.name || 'G').slice(0,1).toUpperCase();
+      avatarNodeEl.style.backgroundImage = group.avatar_path ? `url("${db.storage.from('surf-group-assets').getPublicUrl(group.avatar_path).data.publicUrl}")` : '';
+      avatarNodeEl.style.backgroundSize = 'cover'; avatarNodeEl.style.backgroundPosition = 'center'; avatarNodeEl.style.display = 'grid';
+    }
+    const statusNode = document.getElementById('chatStatus'); if (statusNode) statusNode.textContent = 'Loading members…';
+    const badge = document.getElementById('chatOnlineBadge'); if (badge) badge.style.display = 'none';
     document.getElementById('composer')?.querySelectorAll('input,button').forEach((item) => { item.disabled = false; });
-    app.classList.add('show-chat'); clearMessages('Group messages will appear here.');
-    const { data, error } = await db.from('group_messages').select('id,sender_id,body,created_at').eq('group_id', group.id).order('created_at');
-    if (error) return safeError(error, 'Could not load this group.');
+    app.classList.add('show-chat'); clearMessages('Loading group messages…');
+    const [{ data: memberships, error: memberError }, { data: data, error }] = await Promise.all([
+      db.from('group_members').select('user_id,role').eq('group_id', group.id),
+      db.from('group_messages').select('id,sender_id,body,created_at').eq('group_id', group.id).order('created_at', { ascending: true })
+    ]);
+    if (memberError) return safeError(memberError, 'Could not load group members. Run the group-management migration and check group membership permissions.');
+    if (error) return safeError(error, 'Could not load this group. Check group message permissions.');
+    const memberIds = [...new Set((memberships || []).map(m => m.user_id))];
+    let memberProfiles = [];
+    if (memberIds.length) {
+      const result = await db.from('profiles').select('id,username,display_name,avatar_path,status').in('id', memberIds);
+      if (!result.error) memberProfiles = result.data || [];
+    }
+    const byId = new Map(memberProfiles.map(p => [p.id,p]));
+    if (statusNode) statusNode.textContent = `${memberIds.length || 1} member${(memberIds.length || 1) === 1 ? '' : 's'}`;
     const list = document.getElementById('messages'); list.innerHTML = '';
-    if (!data?.length) return clearMessages('No messages yet. Say hello!');
-    data.forEach((message) => displayMessage(message, message.sender_id === window.surfCurrentUserId ? null : { username: 'Member' }));
+    if (!data?.length) { clearMessages('No messages yet. Say hello!'); return; }
+    data.forEach((message) => {
+      const profile = byId.get(message.sender_id);
+      displayMessage(message, message.sender_id === window.surfCurrentUserId ? null : { username: profile?.display_name || profile?.username || 'Member', display_name: profile?.display_name, avatar_path: profile?.avatar_path, id: profile?.id });
+    });
+    list.scrollTop = list.scrollHeight;
   }
 
   async function sendLiveMessage(text) {
@@ -439,8 +466,12 @@
         if (isOpen) displayMessage({ ...payload.new, delivered_at: now, read_at: isOpen && localReadReceiptsEnabled() ? now : null }, person);
         renderChatList();
         scheduleNotificationRefresh();
-      }).on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'group_messages' }, (payload) => {
-        if (payload.new.group_id === window.surfActiveGroupId && payload.new.sender_id !== window.surfCurrentUserId) displayMessage(payload.new, { username: 'Member' });
+      }).on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'group_messages' }, async (payload) => {
+        renderChatList();
+        if (payload.new.group_id === window.surfActiveGroupId && payload.new.sender_id !== window.surfCurrentUserId) {
+          const { data: sender } = await db.from('profiles').select('id,username,display_name,avatar_path').eq('id', payload.new.sender_id).maybeSingle();
+          displayMessage(payload.new, { username: sender?.display_name || sender?.username || 'Member', display_name: sender?.display_name, avatar_path: sender?.avatar_path, id: sender?.id });
+        }
       }).on('postgres_changes', { event: '*', schema: 'public', table: 'friend_requests', filter: 'addressee_id=eq.' + window.surfCurrentUserId }, () => { scheduleNotificationRefresh(); scheduleRelationshipRefresh(); })
         .on('postgres_changes', { event: '*', schema: 'public', table: 'friend_requests', filter: 'requester_id=eq.' + window.surfCurrentUserId }, () => { scheduleNotificationRefresh(); scheduleRelationshipRefresh(); })
         .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'profiles' }, (payload) => {
@@ -1545,6 +1576,7 @@
       const crop = pendingCropData;
       if (crop) localStorage.setItem(`surf-profile-crop:${window.surfCurrentUserId}:${kind}`, JSON.stringify(crop));
       applyProfileAssets(selfProfile);
+      document.querySelectorAll('[data-self-avatar], #railSelfAvatar, #yourStoryAvatar').forEach((node) => { if (kind === 'avatar') { node.style.backgroundImage = `url("${profileAssetUrl(path)}")`; node.style.backgroundSize = 'cover'; node.style.backgroundPosition = 'center'; node.textContent = ''; } });
       if (previous && previous !== path) await db.storage.from('surf-profile-assets').remove([previous]);
       toast(kind === 'avatar' ? 'Profile picture saved.' : 'Profile banner saved.');
     } catch (error) {
@@ -1559,8 +1591,10 @@
   }
 
   function bindProfileImageUploads() {
-    document.getElementById('pfpInput')?.addEventListener('change', (event) => { pendingProfileImage = event.target.files?.[0] ? { file: event.target.files[0], kind: 'avatar' } : null; });
-    document.getElementById('bannerInput')?.addEventListener('change', (event) => { pendingProfileImage = event.target.files?.[0] ? { file: event.target.files[0], kind: 'banner' } : null; });
+    const avatarInput = document.getElementById('pfpInput');
+    const bannerInput = document.getElementById('bannerInput');
+    if (avatarInput && !avatarInput.dataset.liveUploadBound) { avatarInput.dataset.liveUploadBound = '1'; avatarInput.addEventListener('change', (event) => { pendingProfileImage = event.target.files?.[0] ? { file: event.target.files[0], kind: 'avatar' } : null; }); }
+    if (bannerInput && !bannerInput.dataset.liveUploadBound) { bannerInput.dataset.liveUploadBound = '1'; bannerInput.addEventListener('change', (event) => { pendingProfileImage = event.target.files?.[0] ? { file: event.target.files[0], kind: 'banner' } : null; }); }
     const crop = window.saveCrop;
     window.saveCrop = async function() {
       const pending = pendingProfileImage; pendingProfileImage = null;
