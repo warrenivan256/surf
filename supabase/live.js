@@ -1151,7 +1151,7 @@
     let modal = document.getElementById('postDetailModal');
     if (!modal) {
       modal = document.createElement('div'); modal.id='postDetailModal'; modal.className='modal-back'; modal.style.zIndex='10020';
-      modal.innerHTML='<section class="modal post-detail-modal"><button class="close" type="button" data-close aria-label="Close post">×</button><div class="post-detail-layout"><div class="post-detail-media"></div><aside><div class="post-detail-heading"><img class="post-author-avatar" alt=""><div><div class="post-author-name"></div><p class="post-detail-caption"></p></div></div><div class="post-detail-actions"><button type="button" data-like>♡ Like <span>0</span></button><button type="button" data-focus-comment>Comment</button><button type="button" data-save>Save</button></div><div class="post-comments"></div><form class="post-comment-form"><input maxlength="1000" placeholder="Write a comment…" required><button class="btn primary">Send</button></form></aside></div></section>';
+      modal.innerHTML='<section class="modal post-detail-modal"><button class="close" type="button" data-close aria-label="Close post">×</button><div class="post-detail-layout"><div class="post-detail-media"></div><aside><div class="post-detail-heading"><img class="post-author-avatar" alt=""><div><div class="post-author-name"></div><p class="post-detail-caption"></p></div></div><div class="post-detail-actions"><button type="button" data-like aria-label="Like post"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1.1-1.1a5.5 5.5 0 0 0-7.8 7.8l1.1 1.1L12 21l7.8-7.5 1.1-1.1a5.5 5.5 0 0 0-.1-7.8Z"/></svg><span data-like-count>0</span></button><button type="button" data-focus-comment aria-label="View comments"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 8v.5Z"/></svg><span data-comment-count>0</span></button><button type="button" data-save aria-label="Save post"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4.5h12v16l-6-4-6 4z"/></svg></button></div><div class="post-comments"></div><form class="post-comment-form"><input maxlength="1000" placeholder="Write a comment…" required><button class="btn primary">Send</button></form></aside></div></section>';
       document.body.append(modal); modal.addEventListener('click',e=>{if(e.target===modal||e.target.closest('[data-close]'))modal.style.display='none';});
     }
     modal.dataset.postId=post.id;
@@ -1173,7 +1173,7 @@
         db.from('post_comments').select('id,user_id,body,created_at,parent_comment_id').eq('post_id',post.id).order('created_at')
       ]);
       if(error){commentsBox.textContent='Comments unavailable. Apply the updated post-interactions SQL migration.';return;}
-      likeBtn.innerHTML=(mine?'♥':'♡')+' Like <span>'+(likes||0)+'</span>';likeBtn.dataset.liked=mine?'1':'0';commentsBox.replaceChildren();
+      likeBtn.querySelector('[data-like-count]').textContent=likes||0;likeBtn.dataset.liked=mine?'1':'0';likeBtn.classList.toggle('liked',!!mine);modal.querySelector('[data-comment-count]').textContent=(comments||[]).length;commentsBox.replaceChildren();
       const ids=[...new Set([...(comments||[]).map(c=>c.user_id),post.owner_id])];let profiles=[];if(ids.length){const r=await db.from('profiles').select('id,username,display_name,avatar_path').in('id',ids);profiles=r.data||[];}
       const byId=new Map(profiles.map(p=>[p.id,p]));const own=window.surfCurrentUserId;
       const renderComment=(c,depth=0)=>{const p=byId.get(c.user_id),row=document.createElement('div');row.className='post-comment';row.style.marginLeft=depth?'24px':'0';const avatar=document.createElement('img');avatar.className='post-comment-avatar';avatar.alt='';if(p?.avatar_path)avatar.src=db.storage.from('surf-profile-assets').getPublicUrl(p.avatar_path).data.publicUrl;const body=document.createElement('div');body.className='post-comment-body';const username=document.createElement('strong');username.textContent=p?.display_name||p?.username||'User';const text=document.createElement('p');text.textContent=censor(c.body);body.append(username,text);const tools=document.createElement('div');tools.className='post-comment-tools';const reply=document.createElement('button');reply.type='button';reply.textContent='Reply';reply.onclick=()=>{let replyForm=row.querySelector('.post-comment-reply');if(replyForm){replyForm.remove();return;}replyForm=document.createElement('form');replyForm.className='post-comment-reply';const input=document.createElement('input');input.maxLength=1000;input.placeholder='Write a reply…';input.required=true;const send=document.createElement('button');send.className='btn primary';send.textContent='Reply';replyForm.append(input,send);replyForm.onsubmit=async e=>{e.preventDefault();const bodyText=input.value.trim();if(!bodyText)return;const payload={post_id:post.id,user_id:own,body:censor(bodyText),parent_comment_id:c.id};const r=await db.from('post_comments').insert(payload);if(r.error)return safeError(r.error,'Could not reply. Run the updated post-interactions migration first.');await refreshPostSocial();};body.append(replyForm);input.focus();};tools.append(reply);
@@ -1182,7 +1182,7 @@
     }
     likeBtn.onclick=async()=>{const liked=likeBtn.dataset.liked==='1';const result=liked?await db.from('post_likes').delete().eq('post_id',post.id).eq('user_id',window.surfCurrentUserId):await db.from('post_likes').insert({post_id:post.id,user_id:window.surfCurrentUserId});if(result.error)return safeError(result.error,'Could not update like. Apply post-interactions SQL migration.');await refreshPostSocial();};
     modal.querySelector('[data-focus-comment]').onclick=()=>form.querySelector('input').focus();
-    modal.querySelector('[data-save]').onclick=async()=>{const r=await db.from('saved_posts').select('post_id').eq('post_id',post.id).eq('user_id',window.surfCurrentUserId).maybeSingle();if(r.error)return safeError(r.error,'Could not check saved post.');const x=r.data?await db.from('saved_posts').delete().eq('post_id',post.id).eq('user_id',window.surfCurrentUserId):await db.from('saved_posts').insert({post_id:post.id,user_id:window.surfCurrentUserId});if(x.error)return safeError(x.error,'Could not save post.');toast(r.data?'Post unsaved':'Post saved');};
+    const saveBtn=modal.querySelector('[data-save]');const savedCheck=await db.from('saved_posts').select('post_id').eq('post_id',post.id).eq('user_id',window.surfCurrentUserId).maybeSingle();if(!savedCheck.error)saveBtn.classList.toggle('saved',!!savedCheck.data);saveBtn.onclick=async()=>{const r=await db.from('saved_posts').select('post_id').eq('post_id',post.id).eq('user_id',window.surfCurrentUserId).maybeSingle();if(r.error)return safeError(r.error,'Could not check saved post.');const x=r.data?await db.from('saved_posts').delete().eq('post_id',post.id).eq('user_id',window.surfCurrentUserId):await db.from('saved_posts').insert({post_id:post.id,user_id:window.surfCurrentUserId});if(x.error)return safeError(x.error,'Could not save post.');saveBtn.classList.toggle('saved',!r.data);toast(r.data?'Post unsaved':'Post saved');};
     form.onsubmit=async e=>{e.preventDefault();const input=form.querySelector('input'),body=input.value.trim();if(!body)return;const result=await db.from('post_comments').insert({post_id:post.id,user_id:window.surfCurrentUserId,body:censor(body)});if(result.error)return safeError(result.error,'Could not post comment. Apply the updated post-interactions SQL migration.');input.value='';await refreshPostSocial();};
     await refreshPostSocial();modal.style.zIndex='10020';modal.style.display='grid';
   }
@@ -1593,27 +1593,65 @@
   function bindProfileImageUploads() {
     const avatarInput = document.getElementById('pfpInput');
     const bannerInput = document.getElementById('bannerInput');
-    if (avatarInput && !avatarInput.dataset.liveUploadBound) { avatarInput.dataset.liveUploadBound = '1'; avatarInput.addEventListener('change', (event) => { pendingProfileImage = event.target.files?.[0] ? { file: event.target.files[0], kind: 'avatar' } : null; }, true); }
-    if (bannerInput && !bannerInput.dataset.liveUploadBound) { bannerInput.dataset.liveUploadBound = '1'; bannerInput.addEventListener('change', (event) => { pendingProfileImage = event.target.files?.[0] ? { file: event.target.files[0], kind: 'banner' } : null; }, true); }
-    const crop = window.saveCrop;
-    window.saveCrop = async function() {
-      const pending = pendingProfileImage; pendingProfileImage = null;
-      if (pending && !window.surfCurrentUserId) {
-        pendingProfileImage = pending;
+    if (avatarInput && !avatarInput.dataset.liveUploadBound) {
+      avatarInput.dataset.liveUploadBound = '1';
+      avatarInput.addEventListener('change', (event) => {
+        const file = event.target.files?.[0];
+        pendingProfileImage = file ? { file, kind: 'avatar' } : null;
+      }, true);
+    }
+    if (bannerInput && !bannerInput.dataset.liveUploadBound) {
+      bannerInput.dataset.liveUploadBound = '1';
+      bannerInput.addEventListener('change', (event) => {
+        const file = event.target.files?.[0];
+        pendingProfileImage = file ? { file, kind: 'banner' } : null;
+      }, true);
+    }
+
+    // Use explicit picker handlers so the profile controls work even when nested in overlays.
+    window.openProfileAssetPicker = function(kind) {
+      if (!window.surfCurrentUserId) return toast('Please sign in before changing your profile image.');
+      const input = document.getElementById(kind === 'avatar' ? 'pfpInput' : 'bannerInput');
+      if (!input) return toast('The image picker is unavailable. Refresh the page and try again.');
+      input.value = '';
+      input.click();
+    };
+
+    // Do not replace window.saveCrop: keep the cropper's original global function intact.
+    window.saveProfileCropAndUpload = async function() {
+      const pending = pendingProfileImage;
+      if (!pending) {
+        toast('Choose an image first, then save the crop.');
+        return;
+      }
+      if (!window.surfCurrentUserId) {
         toast('Please sign in again before saving your profile image.');
         return;
       }
       let task = null;
       try { if (typeof cropTask !== 'undefined') task = cropTask; } catch { /* Crop state is not available. */ }
-      crop();
-      if (task?.source && task?.bounds) pendingCropData = { ...task.source, sourceWidth: task.naturalWidth, sourceHeight: task.naturalHeight };
-      if (pending) {
-        try { await persistProfileImage(pending.file, pending.kind); }
-        finally { pendingCropData = null; }
+      if (!task || !task.box || !task.bounds) {
+        toast('Wait for the image crop to load, then try again.');
+        return;
+      }
+      try {
+        // The original cropper calculates task.source and closes the modal.
+        window.saveCrop();
+        if (task.source) pendingCropData = { x: task.source.x, y: task.source.y, width: task.source.w, height: task.source.h, sourceWidth: task.naturalWidth, sourceHeight: task.naturalHeight };
+        await persistProfileImage(pending.file, pending.kind);
+      } catch (error) {
+        console.error('Profile crop/save failed:', error);
+        toast(error?.message || 'Could not save the profile image.');
+      } finally {
+        pendingProfileImage = null;
+        pendingCropData = null;
       }
     };
     const cancel = window.cancelCrop;
-    window.cancelCrop = function() { pendingProfileImage = null; cancel(); };
+    window.cancelCrop = function() {
+      pendingProfileImage = null;
+      if (typeof cancel === 'function') cancel();
+    };
   }
 
   function enterAppWithLiveData() {
