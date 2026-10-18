@@ -125,6 +125,14 @@
       ]);
       if (relationError) throw relationError;
       if (groupError) throw groupError;
+      const ownedGroups = (groupRows || []).filter((group) => group.owner_id === userId);
+      if (ownedGroups.length) {
+        const { error: ownerMembershipError } = await db.from('group_members').upsert(
+          ownedGroups.map((group) => ({ group_id: group.id, user_id: userId, role: 'owner' })),
+          { onConflict: 'group_id,user_id', ignoreDuplicates: true }
+        );
+        if (ownerMembershipError) throw ownerMembershipError;
+      }
       requests = relations || [];
       const ids = [...new Set(requests.flatMap((rel) => rel.status === 'accepted' ? [rel.requester_id, rel.addressee_id] : [rel.requester_id, rel.addressee_id]).filter((id) => id !== userId))];
       if (ids.length) {
@@ -591,8 +599,9 @@
     const username = document.getElementById('editHandle').value.trim().replace(/^@/, '').replace(/[^a-zA-Z0-9._]/g, '').slice(0, 24);
     const bio = document.getElementById('editBio').value.trim().slice(0, 300);
     if (username.length < 3) return toast('Username needs at least 3 characters.');
-    const { error } = await db.from('profiles').update({ display_name: displayName || username, username, bio, updated_at: new Date().toISOString() }).eq('id', window.surfCurrentUserId);
+    const { data: saved, error } = await db.from('profiles').update({ display_name: displayName || username, username, bio, updated_at: new Date().toISOString() }).eq('id', window.surfCurrentUserId).select('id').maybeSingle();
     if (error) return safeError(error, 'Could not save your profile.');
+    if (!saved) return toast('Your profile could not be found. Sign out and sign back in, then try again.');
     document.querySelectorAll('.profile-name').forEach((el) => { el.textContent = displayName || username; });
     document.querySelectorAll('.profile-handle').forEach((el) => { el.textContent = '@' + username; });
     document.querySelectorAll('.bio').forEach((el) => { el.textContent = bio; });
@@ -617,6 +626,11 @@
     if (!selected.length) return toast('Choose at least one friend to add.');
     const { data: group, error } = await db.from('group_conversations').insert({ name, owner_id: window.surfCurrentUserId }).select().single();
     if (error) return safeError(error, 'Could not create the group.');
+    const { error: ownerError } = await db.from('group_members').upsert(
+      { group_id: group.id, user_id: window.surfCurrentUserId, role: 'owner' },
+      { onConflict: 'group_id,user_id', ignoreDuplicates: true }
+    );
+    if (ownerError) return safeError(ownerError, 'Group created but membership could not be saved. Run the latest schema migration, then reload.');
     const { error: memberError } = await db.from('group_members').insert(selected.map((user_id) => ({ group_id: group.id, user_id })));
     if (memberError) return safeError(memberError, 'The group was created, but friends could not be added.');
     input.value = ''; closeModal('createGroupModal'); await loadLiveSurfWorkspace();
@@ -742,6 +756,24 @@
     };
   }
 
+  async function restoreSupabaseSession() {
+    const { data, error } = await db.auth.getSession();
+    if (error) throw error;
+    if (data.session?.user) {
+      const profile = await window.loadSurfProfile(data.session.user);
+      window.enterApp(profile);
+    }
+    db.auth.onAuthStateChange((event) => {
+      if (event === 'SIGNED_OUT') {
+        window.surfCurrentUserId = null;
+        window.surfActiveRecipientId = null;
+        window.surfActiveGroupId = null;
+        window.enterApp(null);
+        showAuthPage('login');
+      }
+    });
+  }
+
   removeSeedContent();
   enterAppWithLiveData();
   window.selectPerson = (row) => { const person = friends.find((item) => item.id === row?.dataset.userId); if (person) return selectLivePerson(row, person); };
@@ -794,5 +826,9 @@
   document.getElementById('composer')?.querySelectorAll('input,button').forEach((item) => { item.disabled = true; });
   bindSearches();
   bindProfileImageUploads();
-  if (window.surfCurrentUserId) loadLiveSurfWorkspace();
+  restoreSupabaseSession().catch((error) => {
+    console.error('Could not restore Surf session:', error);
+    document.getElementById('authError').textContent = error?.message || 'Could not restore your account. Please log in again.';
+    showAuthPage('login');
+  });
 })();
