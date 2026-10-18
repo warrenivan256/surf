@@ -9,6 +9,7 @@
   let storySets = [];
   let highlightSets = [];
   let activeProfile = null;
+  let pageFollowState = { personId: null, iFollow: false, followsMe: false, busy: false };
   let activeStoryProfile = null;
   let activeStoryViewId = null;
   let storyAdvanceTimer = null;
@@ -1409,16 +1410,18 @@
 
   async function updateOwnCounts() {
     const id = window.surfCurrentUserId;
-    const accepted = friends.filter((person) => person.relation.status === 'accepted').length;
-    const { count } = await db.from('posts').select('id', { count: 'exact', head: true }).eq('owner_id', id);
+    if (!id) return;
+    const [postCount, followersCount, followingCount] = await Promise.all([
+      db.from('posts').select('id', { count: 'exact', head: true }).eq('owner_id', id),
+      db.from('surf_follows').select('follower_id', { count: 'exact', head: true }).eq('followed_id', id),
+      db.from('surf_follows').select('followed_id', { count: 'exact', head: true }).eq('follower_id', id)
+    ]);
+    if (postCount.error || followersCount.error || followingCount.error) return;
+    const counts = [postCount.count || 0, followersCount.count || 0, followingCount.count || 0];
     const values = document.querySelectorAll('.stats b');
-    if (values[0]) values[0].textContent = String(count || 0);
-    if (values[1]) values[1].textContent = String(accepted);
-    if (values[2]) values[2].textContent = String(accepted);
+    values.forEach((item, index) => { if (counts[index] !== undefined) item.textContent = String(counts[index]); });
     const profileValues = document.querySelectorAll('#profilePage .profile-stats b');
-    if (profileValues[0]) profileValues[0].textContent = String(count || 0);
-    if (profileValues[1]) profileValues[1].textContent = String(accepted);
-    if (profileValues[2]) profileValues[2].textContent = String(accepted);
+    profileValues.forEach((item, index) => { if (counts[index] !== undefined) item.textContent = String(counts[index]); });
   }
 
   let currentProfileOwnerId = null;
@@ -1747,6 +1750,8 @@
       const addHighlightButton = document.querySelector('#profileHighlightRow .profile-highlight-add');
       if (editBioButton) editBioButton.style.display = isOwnProfile ? 'inline-flex' : 'none';
       if (followButton) followButton.style.display = isOwnProfile ? 'none' : 'inline-flex';
+      if (person?.id && !isOwnProfile) refreshPageFollowState(person);
+      else { pageFollowState = { personId: person?.id || null, iFollow: false, followsMe: false, busy: false }; if (followButton) followButton.style.display = 'none'; }
       // Only the owner of the currently viewed profile can add/manage highlights.
       if (addHighlightButton) addHighlightButton.style.display = isOwnProfile ? 'grid' : 'none';
       if (person?.id) loadProfilePosts(person.id);
@@ -1813,16 +1818,88 @@
   }
 
   async function loadProfileCounts(ownerId) {
-    const [postCount, relationCount] = await Promise.all([
+    const [postCount, followersCount, followingCount] = await Promise.all([
       db.from('posts').select('id', { count: 'exact', head: true }).eq('owner_id', ownerId),
-      db.from('friend_requests').select('id', { count: 'exact', head: true }).eq('status', 'accepted').or(`requester_id.eq.${ownerId},addressee_id.eq.${ownerId}`)
+      db.from('surf_follows').select('follower_id', { count: 'exact', head: true }).eq('followed_id', ownerId),
+      db.from('surf_follows').select('followed_id', { count: 'exact', head: true }).eq('follower_id', ownerId)
     ]);
-    if (postCount.error || relationCount.error) return;
+    if (postCount.error || followersCount.error || followingCount.error) {
+      if (postCount.error) console.error(postCount.error);
+      if (followersCount.error) console.error(followersCount.error);
+      if (followingCount.error) console.error(followingCount.error);
+      return;
+    }
     const values = document.querySelectorAll('#profilePage .profile-stats b');
     if (values[0]) values[0].textContent = String(postCount.count || 0);
-    if (values[1]) values[1].textContent = String(relationCount.count || 0);
-    if (values[2]) values[2].textContent = String(relationCount.count || 0);
+    if (values[1]) values[1].textContent = String(followersCount.count || 0);
+    if (values[2]) values[2].textContent = String(followingCount.count || 0);
   }
+
+  async function refreshPageFollowState(person) {
+    const button = document.getElementById('pageFollowButton');
+    if (!button || !person?.id || !window.surfCurrentUserId || person.id === window.surfCurrentUserId) {
+      if (button) button.style.display = 'none';
+      pageFollowState = { personId: person?.id || null, iFollow: false, followsMe: false, busy: false };
+      return;
+    }
+    pageFollowState = { personId: person.id, iFollow: false, followsMe: false, busy: false };
+    button.style.display = 'inline-flex';
+    button.disabled = true;
+    button.textContent = '…';
+    const [outgoing, incoming] = await Promise.all([
+      db.from('surf_follows').select('follower_id').eq('follower_id', window.surfCurrentUserId).eq('followed_id', person.id).maybeSingle(),
+      db.from('surf_follows').select('follower_id').eq('follower_id', person.id).eq('followed_id', window.surfCurrentUserId).maybeSingle()
+    ]);
+    if (outgoing.error || incoming.error) {
+      console.error(outgoing.error || incoming.error);
+      button.disabled = false;
+      button.textContent = 'Follow';
+      toast('Could not load follow status. Please try again.');
+      return;
+    }
+    pageFollowState = { personId: person.id, iFollow: !!outgoing.data, followsMe: !!incoming.data, busy: false };
+    renderPageFollowButton();
+  }
+
+  function renderPageFollowButton() {
+    const button = document.getElementById('pageFollowButton');
+    if (!button) return;
+    const { iFollow, followsMe, busy } = pageFollowState;
+    button.disabled = !!busy;
+    button.textContent = iFollow && followsMe ? 'Friends' : iFollow ? 'Following' : followsMe ? 'Follow back' : 'Follow';
+    button.dataset.relationship = iFollow && followsMe ? 'friends' : iFollow ? 'following' : followsMe ? 'follow-back' : 'follow';
+    button.setAttribute('aria-label', button.textContent);
+  }
+
+  window.togglePageFollow = async function() {
+    const button = document.getElementById('pageFollowButton');
+    const targetId = pageFollowState.personId || currentProfileOwnerId;
+    if (!button || !targetId || !window.surfCurrentUserId || targetId === window.surfCurrentUserId || pageFollowState.busy) return;
+    const target = activeProfile?.id === targetId ? activeProfile : { id: targetId, username: document.getElementById('pageHandle')?.textContent || 'this user', display_name: document.getElementById('pageName')?.textContent || 'this user' };
+    const label = target.display_name || target.username || 'this user';
+    const { iFollow, followsMe } = pageFollowState;
+    if (iFollow && followsMe && !window.confirm(`Are you sure you want to unfriend ${label}? You will both stop following each other.`)) return;
+    if (iFollow && !followsMe && !window.confirm(`Unfollow ${label}?`)) return;
+    pageFollowState.busy = true;
+    renderPageFollowButton();
+    let result;
+    if (iFollow && followsMe) {
+      result = await db.rpc('surf_unfriend', { target_user_id: targetId });
+    } else if (iFollow) {
+      result = await db.from('surf_follows').delete().eq('follower_id', window.surfCurrentUserId).eq('followed_id', targetId);
+    } else {
+      result = await db.from('surf_follows').insert({ follower_id: window.surfCurrentUserId, followed_id: targetId });
+    }
+    if (result?.error) {
+      pageFollowState.busy = false;
+      renderPageFollowButton();
+      return safeError(result.error, 'Could not update this follow relationship.');
+    }
+    await refreshPageFollowState(target);
+    await loadProfileCounts(targetId);
+    await updateOwnCounts();
+    toast(iFollow && followsMe ? 'You are no longer friends' : iFollow ? 'Unfollowed ' + label : followsMe ? 'You are now friends with ' + label : 'Following ' + label);
+  };
 
   async function restoreSupabaseSession() {
     const { data, error } = await db.auth.getSession();
