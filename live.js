@@ -663,23 +663,32 @@
     if (!file || !window.surfCurrentUserId) return;
     if (!file.type.startsWith('image/')) return toast('Choose an image file.');
     if (file.size > 10 * 1024 * 1024) return toast('Images must be 10 MB or smaller.');
-    const extension = (file.name.split('.').pop() || 'jpg').toLowerCase().replace(/[^a-z0-9]/g, '') || 'jpg';
-    const path = `${window.surfCurrentUserId}/${kind}-${Date.now()}.${extension}`;
-    const { error: uploadError } = await db.storage.from('surf-profile-assets').upload(path, file, { contentType: file.type, upsert: false });
-    if (uploadError) return safeError(uploadError, 'Image upload failed. Check profile image storage setup.');
-    const column = kind === 'avatar' ? 'avatar_path' : 'banner_path';
-    const previous = selfProfile?.[column];
-    const { error: saveError } = await db.from('profiles').update({ [column]: path, updated_at: new Date().toISOString() }).eq('id', window.surfCurrentUserId);
-    if (saveError) {
-      await db.storage.from('surf-profile-assets').remove([path]);
-      return safeError(saveError, 'Image uploaded but could not be saved to your profile.');
+    let path = '';
+    try {
+      const extension = (file.name.split('.').pop() || 'jpg').toLowerCase().replace(/[^a-z0-9]/g, '') || 'jpg';
+      path = `${window.surfCurrentUserId}/${kind}-${Date.now()}.${extension}`;
+      const { error: uploadError } = await db.storage.from('surf-profile-assets').upload(path, file, { contentType: file.type, upsert: false });
+      if (uploadError) throw uploadError;
+      const column = kind === 'avatar' ? 'avatar_path' : 'banner_path';
+      const previous = selfProfile?.[column];
+      const { data: saved, error: saveError } = await db.from('profiles').update({ [column]: path, updated_at: new Date().toISOString() }).eq('id', window.surfCurrentUserId).select('id').maybeSingle();
+      if (saveError) throw saveError;
+      if (!saved) throw new Error('Your profile row was not found. Sign out and sign back in, then try again.');
+      selfProfile = { ...selfProfile, [column]: path };
+      const crop = pendingCropData;
+      if (crop) localStorage.setItem(`surf-profile-crop:${window.surfCurrentUserId}:${kind}`, JSON.stringify(crop));
+      applyProfileAssets(selfProfile);
+      if (previous && previous !== path) await db.storage.from('surf-profile-assets').remove([previous]);
+      toast(kind === 'avatar' ? 'Profile picture saved.' : 'Profile banner saved.');
+    } catch (error) {
+      if (path) await db.storage.from('surf-profile-assets').remove([path]).catch(() => {});
+      console.error('Surf profile image save failed:', error);
+      const message = error?.message || 'Upload failed. Run supabase/profile-assets.sql, then try again.';
+      toast(/bucket not found|row-level security/i.test(message) ? 'Profile image storage is not ready. Run profile-assets.sql in Supabase, then upload again.' : message);
+    } finally {
+      const input = document.getElementById(kind === 'avatar' ? 'pfpInput' : 'bannerInput');
+      if (input) input.value = '';
     }
-    selfProfile = { ...selfProfile, [column]: path };
-    const crop = pendingCropData;
-    if (crop) localStorage.setItem(`surf-profile-crop:${window.surfCurrentUserId}:${kind}`, JSON.stringify(crop));
-    applyProfileAssets(selfProfile);
-    if (previous && previous !== path) await db.storage.from('surf-profile-assets').remove([previous]);
-    toast(kind === 'avatar' ? 'Profile picture saved.' : 'Profile banner saved.');
   }
 
   function bindProfileImageUploads() {
