@@ -16,6 +16,7 @@
   let pendingCropData = null;
   let notificationItems = [];
   let notificationRefreshTimer = null;
+  let workspaceRefreshTimer = null;
 
   const initials = (person) => (person?.display_name || person?.username || '?')
     .trim().split(/\s+/).slice(0, 2).map((part) => part[0]?.toUpperCase() || '').join('');
@@ -64,7 +65,11 @@
   function avatarNode(person, className = 'avatar') {
     const node = document.createElement('span');
     node.className = className;
-    node.textContent = initials(person);
+    const url = profileAssetUrl(person?.avatar_path);
+    node.textContent = url ? '' : initials(person);
+    node.style.backgroundImage = url ? `url("${url}")` : '';
+    node.style.backgroundSize = 'cover';
+    node.style.backgroundPosition = 'center';
     return node;
   }
 
@@ -230,7 +235,11 @@
     row.classList.add('selected');
     window.surfActiveRecipientId = person.id; window.surfActiveGroupId = null;
     document.getElementById('chatName').textContent = person.display_name || person.username;
-    const avatar = document.getElementById('chatAvatar'); avatar.textContent = initials(person); avatar.style.display = 'grid';
+    const avatar = document.getElementById('chatAvatar');
+    const avatarUrl = profileAssetUrl(person.avatar_path);
+    avatar.textContent = avatarUrl ? '' : initials(person);
+    avatar.style.backgroundImage = avatarUrl ? `url("${avatarUrl}")` : '';
+    avatar.style.backgroundSize = 'cover'; avatar.style.backgroundPosition = 'center'; avatar.style.display = 'grid';
     document.getElementById('chatStatus').textContent = '● ' + statusLabel(person.status);
     document.getElementById('composer')?.querySelectorAll('input,button').forEach((item) => { item.disabled = false; });
     document.getElementById('blockedNotice').style.display = 'none';
@@ -242,7 +251,7 @@
     document.querySelectorAll('#chatList .person').forEach((item) => item.classList.remove('selected'));
     row.classList.add('selected'); window.surfActiveRecipientId = null; window.surfActiveGroupId = group.id;
     document.getElementById('chatName').textContent = group.name;
-    document.getElementById('chatAvatar').textContent = 'G'; document.getElementById('chatAvatar').style.display = 'grid';
+    document.getElementById('chatAvatar').textContent = 'G'; document.getElementById('chatAvatar').style.backgroundImage = ''; document.getElementById('chatAvatar').style.display = 'grid';
     document.getElementById('chatStatus').textContent = 'Group conversation';
     document.getElementById('composer')?.querySelectorAll('input,button').forEach((item) => { item.disabled = false; });
     app.classList.add('show-chat'); clearMessages('Group messages will appear here.');
@@ -277,8 +286,8 @@
         scheduleNotificationRefresh();
       }).on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'group_messages' }, (payload) => {
         if (payload.new.group_id === window.surfActiveGroupId && payload.new.sender_id !== window.surfCurrentUserId) displayMessage(payload.new, { username: 'Member' });
-      }).on('postgres_changes', { event: '*', schema: 'public', table: 'friend_requests', filter: 'addressee_id=eq.' + window.surfCurrentUserId }, () => scheduleNotificationRefresh())
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'friend_requests', filter: 'requester_id=eq.' + window.surfCurrentUserId }, () => scheduleNotificationRefresh())
+      }).on('postgres_changes', { event: '*', schema: 'public', table: 'friend_requests', filter: 'addressee_id=eq.' + window.surfCurrentUserId }, () => { scheduleNotificationRefresh(); scheduleRelationshipRefresh(); })
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'friend_requests', filter: 'requester_id=eq.' + window.surfCurrentUserId }, () => { scheduleNotificationRefresh(); scheduleRelationshipRefresh(); })
         .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'stories' }, () => scheduleNotificationRefresh())
         .subscribe();
   }
@@ -295,7 +304,7 @@
       if (activeFriendTab === 'online') return person.status === 'online';
       return !query || `${person.username} ${person.display_name}`.toLowerCase().includes(query);
     });
-    document.getElementById('pendingCount').textContent = String(friends.filter((item) => item.relation.status === 'pending' && item.relation.addressee_id === window.surfCurrentUserId).length);
+    document.getElementById('pendingCount').textContent = String(friends.filter((item) => item.relation.status === 'pending').length);
     list.innerHTML = '';
     const sections = activeFriendTab === 'pending' ? [['Pending requests', 'pending']] : activeFriendTab === 'online' ? [['Online', 'online']] : [['Online', 'online'], ['Do not disturb', 'dnd'], ['Offline', 'offline']];
     sections.forEach(([label, status]) => {
@@ -373,9 +382,9 @@
 
   async function openLiveProfile(person) {
     activeProfile = person;
-    document.getElementById('discoverAvatar').textContent = initials(person);
     const avatarUrl = profileAssetUrl(person.avatar_path);
     const discoverAvatar = document.getElementById('discoverAvatar');
+    discoverAvatar.textContent = avatarUrl ? '' : initials(person);
     discoverAvatar.style.backgroundImage = avatarUrl ? `url("${avatarUrl}")` : '';
     discoverAvatar.style.backgroundSize = 'cover'; discoverAvatar.style.backgroundPosition = 'center';
     const discoverBanner = document.getElementById('discoverBanner');
@@ -522,6 +531,11 @@
   function scheduleNotificationRefresh() {
     clearTimeout(notificationRefreshTimer);
     notificationRefreshTimer = setTimeout(() => refreshNotifications(false), 350);
+  }
+
+  function scheduleRelationshipRefresh() {
+    clearTimeout(workspaceRefreshTimer);
+    workspaceRefreshTimer = setTimeout(() => loadLiveSurfWorkspace(), 350);
   }
 
   function renderNotifications() {
@@ -748,9 +762,9 @@
     document.getElementById('profileCardBio').textContent = person.bio || 'No bio yet.';
     const ageBadge = document.getElementById('profileCardAgeBadge'); if (ageBadge) { ageBadge.textContent = person.is_minor ? '🧒 Minor' : '18+'; ageBadge.style.display = 'inline-flex'; }
     renderSocialLinks(document.getElementById('profileCardSocialLinks'), person.social_links);
-    document.getElementById('profileCardAvatar').textContent = initials(person);
     const cardAvatarUrl = profileAssetUrl(person.avatar_path);
     const cardAvatar = document.getElementById('profileCardAvatar');
+    cardAvatar.textContent = cardAvatarUrl ? '' : initials(person);
     cardAvatar.style.backgroundImage = cardAvatarUrl ? `url("${cardAvatarUrl}")` : '';
     cardAvatar.style.backgroundSize = 'cover'; cardAvatar.style.backgroundPosition = 'center';
     const cardBanner = document.getElementById('profileCardBanner');
