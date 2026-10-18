@@ -26,6 +26,10 @@
   let notificationItems = [];
   let notificationRefreshTimer = null;
   let workspaceRefreshTimer = null;
+  let surfFeedTab = 'for-you';
+  let surfFeedDraftFile = null;
+  let surfFeedChannel = null;
+  let surfFeedRows = [];
 
   const initials = (person) => (person?.display_name || person?.username || '?')
     .trim().split(/\s+/).slice(0, 2).map((part) => part[0]?.toUpperCase() || '').join('');
@@ -1147,6 +1151,166 @@
     closeModal('storyViewer'); selectLivePerson(chatRow, activeStoryProfile); await sendLiveMessage(reply);
   }
 
+  function openSurfFeed() {
+    if (!window.surfCurrentUserId) return toast('Sign in to open Surf Feed.');
+    const overlay = document.getElementById('surfFeedOverlay');
+    if (!overlay) return;
+    overlay.style.display = 'block'; overlay.setAttribute('aria-hidden', 'false');
+    document.querySelectorAll('.rail .navbtn').forEach((button) => button.classList.toggle('active', button.getAttribute('aria-label') === 'Open Surf Feed'));
+    const avatar = document.getElementById('surfFeedComposerAvatar');
+    const avatarUrl = profileAssetUrl(selfProfile?.avatar_path);
+    if (avatar) { avatar.style.backgroundImage = avatarUrl ? `url("${avatarUrl}")` : ''; avatar.textContent = avatarUrl ? '' : initials(selfProfile); }
+    loadSurfFeed();
+    if (!surfFeedChannel) {
+      surfFeedChannel = db.channel('surf-feed-live-' + window.surfCurrentUserId)
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'surf_feed_posts' }, () => { if (document.getElementById('surfFeedOverlay')?.style.display !== 'none') loadSurfFeed(); })
+        .subscribe();
+    }
+  }
+  function closeSurfFeed() {
+    const overlay = document.getElementById('surfFeedOverlay');
+    if (overlay) { overlay.style.display = 'none'; overlay.setAttribute('aria-hidden', 'true'); }
+    document.querySelectorAll('.rail .navbtn').forEach((button) => button.classList.toggle('active', button.getAttribute('aria-label') === 'Chats'));
+  }
+  function setSurfFeedTab(tab, button) {
+    surfFeedTab = tab === 'following' ? 'following' : 'for-you';
+    document.querySelectorAll('[data-feed-tab]').forEach((item) => item.classList.toggle('active', item.dataset.feedTab === surfFeedTab));
+    loadSurfFeed();
+  }
+  function feedTimeLabel(value) {
+    const date = new Date(value); if (Number.isNaN(date.getTime())) return '';
+    const seconds = Math.max(0, Math.floor((Date.now() - date.getTime()) / 1000));
+    if (seconds < 60) return seconds + 's'; if (seconds < 3600) return Math.floor(seconds / 60) + 'm';
+    if (seconds < 86400) return Math.floor(seconds / 3600) + 'h'; if (seconds < 604800) return Math.floor(seconds / 86400) + 'd';
+    return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  }
+  async function loadSurfFeed() {
+    const list = document.getElementById('surfFeedList'); if (!list || !window.surfCurrentUserId) return;
+    list.innerHTML = '<div class="surf-feed-empty">Loading your timeline…</div>';
+    let followedIds = [];
+    if (surfFeedTab === 'following') {
+      const { data: follows, error: followError } = await db.from('surf_follows').select('followed_id').eq('follower_id', window.surfCurrentUserId);
+      if (followError) return showSurfFeedError(followError, 'Could not load the Following timeline.');
+      followedIds = (follows || []).map((row) => row.followed_id);
+    }
+    let query = db.from('surf_feed_posts').select('*').order('created_at', { ascending: false }).limit(80);
+    if (surfFeedTab === 'following') query = query.in('owner_id', [...new Set([window.surfCurrentUserId, ...followedIds])]);
+    const { data: posts, error } = await query;
+    if (error) return showSurfFeedError(error, 'Could not load Surf Feed. Run surf-feed.sql in Supabase first.');
+    surfFeedRows = posts || [];
+    if (!surfFeedRows.length) { list.innerHTML = `<div class="surf-feed-empty"><b>${surfFeedTab === 'following' ? 'No posts from people you follow yet.' : 'Your timeline starts here.'}</b><br>Share a thought, photo, or video with Surf.</div>`; return; }
+    const ownerIds = [...new Set(surfFeedRows.map((post) => post.owner_id))];
+    const { data: profiles, error: profileError } = await db.from('profiles').select('id,username,display_name,avatar_path').in('id', ownerIds);
+    if (profileError) console.warn('Feed profiles could not be loaded:', profileError.message);
+    const profileMap = new Map((profiles || []).map((profile) => [profile.id, profile]));
+    const postIds = surfFeedRows.map((post) => post.id);
+    const [likesResult, repostsResult, commentsResult, savedResult] = await Promise.all([
+      db.from('surf_feed_likes').select('post_id,user_id').in('post_id', postIds),
+      db.from('surf_feed_reposts').select('post_id,user_id').in('post_id', postIds),
+      db.from('surf_feed_comments').select('post_id').in('post_id', postIds),
+      db.from('surf_feed_saved_posts').select('post_id').eq('user_id', window.surfCurrentUserId).in('post_id', postIds)
+    ]);
+    const likes = likesResult.data || [], reposts = repostsResult.data || [], comments = commentsResult.data || [], saved = new Set((savedResult.data || []).map((row) => row.post_id));
+    const liked = new Set(likes.filter((row) => row.user_id === window.surfCurrentUserId).map((row) => row.post_id));
+    const reposted = new Set(reposts.filter((row) => row.user_id === window.surfCurrentUserId).map((row) => row.post_id));
+    list.replaceChildren();
+    for (const post of surfFeedRows) {
+      const owner = profileMap.get(post.owner_id) || { username: 'Surf member', display_name: 'Surf member' };
+      const card = document.createElement('article'); card.className = 'surf-feed-card'; card.dataset.postId = post.id;
+      const avatar = document.createElement('div'); avatar.className = 'surf-feed-avatar'; const avatarUrl = profileAssetUrl(owner.avatar_path); avatar.style.backgroundImage = avatarUrl ? `url("${avatarUrl}")` : ''; avatar.textContent = avatarUrl ? '' : initials(owner);
+      const main = document.createElement('div'); main.className = 'surf-feed-card-main';
+      const author = document.createElement('div'); author.className = 'surf-feed-author';
+      const name = document.createElement('strong'); name.textContent = owner.display_name || owner.username || 'Surf member';
+      const handle = document.createElement('span'); handle.className = 'feed-handle'; handle.textContent = '@' + (owner.username || 'member');
+      const dot = document.createElement('span'); dot.textContent = '·';
+      const time = document.createElement('span'); time.className = 'feed-time'; time.textContent = feedTimeLabel(post.created_at);
+      author.append(name, handle, dot, time);
+      const body = document.createElement('div'); body.className = 'surf-feed-body'; body.textContent = post.body || '';
+      main.append(author, body);
+      if (post.media_path) {
+        const { data: signed, error: mediaError } = await db.storage.from('surf-feed-media').createSignedUrl(post.media_path, 3600);
+        if (!mediaError && signed?.signedUrl) {
+          const media = post.media_type === 'video' ? document.createElement('video') : document.createElement('img');
+          media.className = 'surf-feed-media'; media.src = signed.signedUrl; media.alt = 'Feed attachment';
+          if (media.tagName === 'VIDEO') { media.controls = true; media.preload = 'metadata'; }
+          main.append(media);
+        }
+      }
+      const actionBar = document.createElement('div'); actionBar.className = 'surf-feed-actions';
+      const postLikes = likes.filter((row) => row.post_id === post.id).length;
+      const postReposts = reposts.filter((row) => row.post_id === post.id).length;
+      const postComments = comments.filter((row) => row.post_id === post.id).length;
+      const makeAction = (kind, symbol, count, active, label) => {
+        const button = document.createElement('button'); button.type = 'button'; button.className = 'surf-feed-action' + (active ? ' ' + active : ''); button.setAttribute('aria-label', label); button.title = label;
+        const icon = document.createElement('span'); icon.textContent = symbol; icon.style.fontSize = '19px';
+        const number = document.createElement('span'); number.textContent = count == null ? '' : String(count); button.append(icon, number);
+        button.onclick = (event) => { event.stopPropagation(); if (kind === 'like') toggleSurfFeedLike(post.id, button); else if (kind === 'repost') toggleSurfFeedRepost(post.id, button); else if (kind === 'comment') toggleSurfFeedCommentForm(card, post.id); else if (kind === 'save') toggleSurfFeedSave(post.id, button); else if (kind === 'share') shareSurfFeedPost(post.id); };
+        return button;
+      };
+      actionBar.append(makeAction('comment', '♧', postComments, '', 'Reply'), makeAction('repost', '↻', postReposts, reposted.has(post.id) ? 'reposted' : '', 'Repost'), makeAction('like', liked.has(post.id) ? '♥' : '♡', postLikes, liked.has(post.id) ? 'liked' : '', 'Like'), makeAction('save', saved.has(post.id) ? '▣' : '▢', null, saved.has(post.id) ? 'saved' : '', 'Save'), makeAction('share', '↗', null, '', 'Share'));
+      main.append(actionBar);
+      const form = document.createElement('form'); form.className = 'surf-feed-comment-form'; form.innerHTML = '<input maxlength="1000" placeholder="Write a reply…" aria-label="Write a reply" required><button type="submit">Reply</button>';
+      form.onsubmit = async (event) => { event.preventDefault(); const input = form.querySelector('input'); const bodyText = input.value.trim(); if (!bodyText) return; const { error: commentError } = await db.from('surf_feed_comments').insert({ post_id: post.id, user_id: window.surfCurrentUserId, body: bodyText }); if (commentError) return safeError(commentError, 'Could not send reply.'); toast('Reply posted.'); await loadSurfFeed(); };
+      main.append(form); card.append(avatar, main); list.append(card);
+    }
+  }
+  function showSurfFeedError(error, fallback) { console.error(error); const list = document.getElementById('surfFeedList'); if (list) list.innerHTML = `<div class="surf-feed-error">${escapeText(error?.message || fallback)}</div>`; }
+  async function publishSurfFeedPost() {
+    const input = document.getElementById('surfFeedComposerText'), fileInput = document.getElementById('surfFeedMediaInput'), button = document.getElementById('surfFeedPublishButton');
+    const body = (input?.value || '').trim(); const file = surfFeedDraftFile;
+    if (!body && !file) return toast('Write something or attach a photo/video first.');
+    if (!window.surfCurrentUserId) return toast('Sign in to post.');
+    button.disabled = true; button.textContent = 'Posting…';
+    try {
+      const postId = crypto.randomUUID(); let mediaPath = null, mediaType = null;
+      if (file) {
+        const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(-90) || 'feed-media';
+        mediaPath = `${window.surfCurrentUserId}/${postId}/${safeName}`; mediaType = file.type.startsWith('video/') ? 'video' : 'image';
+        const { error: uploadError } = await db.storage.from('surf-feed-media').upload(mediaPath, file, { contentType: file.type, upsert: false });
+        if (uploadError) throw uploadError;
+      }
+      const { error } = await db.from('surf_feed_posts').insert({ id: postId, owner_id: window.surfCurrentUserId, body, media_path: mediaPath, media_type: mediaType });
+      if (error) { if (mediaPath) await db.storage.from('surf-feed-media').remove([mediaPath]); throw error; }
+      input.value = ''; fileInput.value = ''; surfFeedDraftFile = null;
+      const preview = document.getElementById('surfFeedComposerPreview'); if (preview) { preview.removeAttribute('src'); preview.style.display = 'none'; }
+      document.getElementById('surfFeedMediaName').textContent = '';
+      toast('Posted to Surf Feed.'); await loadSurfFeed();
+    } catch (error) { safeError(error, 'Could not publish your post. Check the Surf Feed database setup.'); }
+    finally { button.disabled = false; button.textContent = 'Post'; }
+  }
+  async function toggleSurfFeedLike(postId, button) {
+    const { data, error } = await db.from('surf_feed_likes').select('post_id').eq('post_id', postId).eq('user_id', window.surfCurrentUserId).maybeSingle();
+    if (error) return safeError(error, 'Could not check like.');
+    const result = data ? await db.from('surf_feed_likes').delete().eq('post_id', postId).eq('user_id', window.surfCurrentUserId) : await db.from('surf_feed_likes').insert({ post_id: postId, user_id: window.surfCurrentUserId });
+    if (result.error) return safeError(result.error, 'Could not update like.');
+    await loadSurfFeed();
+  }
+  async function toggleSurfFeedRepost(postId) {
+    const { data, error } = await db.from('surf_feed_reposts').select('post_id').eq('post_id', postId).eq('user_id', window.surfCurrentUserId).maybeSingle();
+    if (error) return safeError(error, 'Could not check repost.');
+    const result = data ? await db.from('surf_feed_reposts').delete().eq('post_id', postId).eq('user_id', window.surfCurrentUserId) : await db.from('surf_feed_reposts').insert({ post_id: postId, user_id: window.surfCurrentUserId });
+    if (result.error) return safeError(result.error, 'Could not update repost.');
+    await loadSurfFeed();
+  }
+  async function toggleSurfFeedSave(postId) {
+    const { data, error } = await db.from('surf_feed_saved_posts').select('post_id').eq('post_id', postId).eq('user_id', window.surfCurrentUserId).maybeSingle();
+    if (error) return safeError(error, 'Could not check saved post.');
+    const result = data ? await db.from('surf_feed_saved_posts').delete().eq('post_id', postId).eq('user_id', window.surfCurrentUserId) : await db.from('surf_feed_saved_posts').insert({ post_id: postId, user_id: window.surfCurrentUserId });
+    if (result.error) return safeError(result.error, 'Could not save post.');
+    await loadSurfFeed(); toast(data ? 'Post removed from saved.' : 'Post saved.');
+  }
+  function toggleSurfFeedCommentForm(card) { const form = card.querySelector('.surf-feed-comment-form'); if (!form) return; form.classList.toggle('open'); if (form.classList.contains('open')) form.querySelector('input')?.focus(); }
+  async function shareSurfFeedPost(postId) { const url = location.origin + location.pathname + '#surf-feed-' + postId; try { await navigator.clipboard.writeText(url); toast('Post link copied.'); } catch { toast(url); } }
+  function onSurfFeedMediaChange(event) {
+    const file = event.target.files?.[0]; surfFeedDraftFile = file || null;
+    const name = document.getElementById('surfFeedMediaName'), preview = document.getElementById('surfFeedComposerPreview');
+    if (name) name.textContent = file?.name || '';
+    if (preview) {
+      if (file && file.type.startsWith('image/')) { preview.src = URL.createObjectURL(file); preview.style.display = 'block'; }
+      else { preview.removeAttribute('src'); preview.style.display = 'none'; }
+    }
+  }
+
   function openPostComposer() {
     if (!window.surfCurrentUserId) return toast('Sign in to create a post.');
     postDraftFile = null; document.getElementById('postMediaInput').value = '';
@@ -1987,6 +2151,11 @@
   window.toggleStoryLike = toggleStoryLike;
   window.openStoryArchive = openStoryArchive;
   window.openSavedPosts = openSavedPosts;
+  window.openSurfFeed = openSurfFeed;
+  window.closeSurfFeed = closeSurfFeed;
+  window.setSurfFeedTab = setSurfFeedTab;
+  window.publishSurfFeedPost = publishSurfFeedPost;
+  document.getElementById('surfFeedMediaInput')?.addEventListener('change', onSurfFeedMediaChange);
   window.openPostComposer = openPostComposer;
   window.publishPost = publishPost;
   window.replyToStory = replyToStory;
