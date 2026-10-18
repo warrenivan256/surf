@@ -12,6 +12,7 @@
   let activeStoryProfile = null;
   let activeStoryViewId = null;
   let storyAdvanceTimer = null;
+  let storyProgressSequence = 0;
   let postDraftFile = null;
   let archivedStories = [];
   const likedStoryIds = new Set();
@@ -150,7 +151,7 @@
       requests = relations || [];
       const ids = [...new Set(requests.flatMap((rel) => [rel.requester_id, rel.addressee_id]).filter((id) => id !== userId))];
       if (ids.length) {
-        const { data: profiles, error } = await db.from('profiles').select('id,username,display_name,bio,status,created_at,avatar_path,banner_path,is_minor,social_links').in('id', ids);
+        const { data: profiles, error } = await db.from('profiles').select('id,username,display_name,bio,status,created_at,avatar_path,banner_path,is_minor,social_links,read_receipts_enabled').in('id', ids);
         if (error) throw error;
         const byId = new Map((profiles || []).map((profile) => [profile.id, profile]));
         const relationsByPerson = new Map();
@@ -165,6 +166,12 @@
         }).filter((person) => person.id);
       } else friends = [];
       groups = groupRows || [];
+      const { data: ownReceiptSetting, error: receiptSettingError } = await db.from('profiles').select('read_receipts_enabled').eq('id', userId).maybeSingle();
+      if (receiptSettingError) throw receiptSettingError;
+      if (ownReceiptSetting) {
+        selfProfile = { ...selfProfile, ...ownReceiptSetting };
+        localStorage.setItem('surfPref_readReceipts', String(ownReceiptSetting.read_receipts_enabled));
+      }
       await Promise.all([renderChatList(), renderFriendsList(), loadStories(), updateOwnCounts()]);
       renderDiscoverResults();
       syncGroupPicker();
@@ -178,7 +185,7 @@
 
   async function latestMessages() {
     const id = window.surfCurrentUserId;
-    const { data, error } = await db.from('direct_messages').select('id,sender_id,recipient_id,body,created_at')
+      const { data, error } = await db.from('direct_messages').select('id,sender_id,recipient_id,body,created_at,delivered_at,read_at')
       .or(`sender_id.eq.${id},recipient_id.eq.${id}`).order('created_at', { ascending: false }).limit(200);
     if (error) throw error;
     return data || [];
@@ -220,6 +227,28 @@
 
   function clearMessages(message) { setEmpty(document.getElementById('messages'), message); }
 
+  function localReadReceiptsEnabled() {
+    return localStorage.getItem('surfPref_readReceipts') !== 'false' && selfProfile?.read_receipts_enabled !== false;
+  }
+
+  function updateChatPresence(person) {
+    const badge = document.getElementById('chatOnlineBadge');
+    const status = document.getElementById('chatStatus');
+    if (!badge || !status) return;
+    badge.style.display = person?.status === 'online' ? 'inline-flex' : 'none';
+    status.textContent = person?.status === 'online' ? '' : statusLabel(person?.status);
+  }
+
+  async function markMessagesDelivered(messages, markRead = false) {
+    const ids = messages.map((message) => message.id).filter(Boolean);
+    if (!ids.length) return;
+    const now = new Date().toISOString();
+    const changes = { delivered_at: now };
+    if (markRead && localReadReceiptsEnabled()) changes.read_at = now;
+    const { error } = await db.from('direct_messages').update(changes).in('id', ids).eq('recipient_id', window.surfCurrentUserId);
+    if (error) console.warn('Could not update message delivery state.', error);
+  }
+
   function displayMessage(message, person) {
     const list = document.getElementById('messages');
     if (!list) return;
@@ -227,10 +256,13 @@
     const row = document.createElement('div');
     const mine = message.sender_id === window.surfCurrentUserId;
     row.className = `msgrow${mine ? ' me' : ''}`;
+    row.dataset.messageId = message.id || '';
     if (!mine) row.append(avatarNode(person, 'mini-avatar'));
     const wrap = document.createElement('div');
     const bubble = document.createElement('div'); bubble.className = 'bubble'; bubble.textContent = message.body;
-    const stamp = document.createElement('div'); stamp.className = 'stamp'; stamp.textContent = new Date(message.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const stamp = document.createElement('div'); stamp.className = 'stamp';
+    const sentTime = new Date(message.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    stamp.textContent = mine ? `${sentTime} · ${message.read_at && localReadReceiptsEnabled() && person?.read_receipts_enabled !== false ? 'Read' : message.delivered_at ? 'Delivered' : 'Sent'}` : sentTime;
     wrap.append(bubble, stamp); row.append(wrap); list.append(row); list.scrollTop = list.scrollHeight;
   }
 
@@ -238,8 +270,15 @@
     clearMessages(`Your conversation with ${person.display_name || person.username} will appear here.`);
     const current = window.surfCurrentUserId;
     const filter = `and(sender_id.eq.${current},recipient_id.eq.${person.id}),and(sender_id.eq.${person.id},recipient_id.eq.${current})`;
-    const { data, error } = await db.from('direct_messages').select('id,sender_id,recipient_id,body,created_at').or(filter).order('created_at');
+    const { data, error } = await db.from('direct_messages').select('id,sender_id,recipient_id,body,created_at,delivered_at,read_at').or(filter).order('created_at');
     if (error) return safeError(error, 'Could not load this conversation.');
+    const incoming = (data || []).filter((message) => message.sender_id === person.id && (!message.delivered_at || (localReadReceiptsEnabled() && !message.read_at)));
+    if (incoming.length) {
+      const changes = { delivered_at: new Date().toISOString() };
+      if (localReadReceiptsEnabled()) changes.read_at = new Date().toISOString();
+      await db.from('direct_messages').update(changes).in('id', incoming.map((message) => message.id)).eq('recipient_id', current);
+      incoming.forEach((message) => { message.delivered_at ||= changes.delivered_at; if (changes.read_at) message.read_at = changes.read_at; });
+    }
     const list = document.getElementById('messages'); list.innerHTML = '';
     if (!data?.length) return clearMessages('No messages yet. Say hello!');
     data.forEach((message) => displayMessage(message, person));
@@ -255,7 +294,7 @@
     avatar.textContent = avatarUrl ? '' : initials(person);
     avatar.style.backgroundImage = avatarUrl ? `url("${avatarUrl}")` : '';
     avatar.style.backgroundSize = 'cover'; avatar.style.backgroundPosition = 'center'; avatar.style.display = 'grid';
-    document.getElementById('chatStatus').textContent = '● ' + statusLabel(person.status);
+    updateChatPresence(person);
     document.getElementById('composer')?.querySelectorAll('input,button').forEach((item) => { item.disabled = false; });
     document.getElementById('blockedNotice').style.display = 'none';
     app.classList.add('show-chat');
@@ -268,6 +307,7 @@
     document.getElementById('chatName').textContent = group.name;
     document.getElementById('chatAvatar').textContent = 'G'; document.getElementById('chatAvatar').style.backgroundImage = ''; document.getElementById('chatAvatar').style.display = 'grid';
     document.getElementById('chatStatus').textContent = 'Group conversation';
+    updateChatPresence(null);
     document.getElementById('composer')?.querySelectorAll('input,button').forEach((item) => { item.disabled = false; });
     app.classList.add('show-chat'); clearMessages('Group messages will appear here.');
     const { data, error } = await db.from('group_messages').select('id,sender_id,body,created_at').eq('group_id', group.id).order('created_at');
@@ -295,14 +335,22 @@
   function subscribeMessages() {
     if (messageChannel) db.removeChannel(messageChannel);
     messageChannel = db.channel('surf-live-messages-' + window.surfCurrentUserId)
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'direct_messages', filter: `recipient_id=eq.${window.surfCurrentUserId}` }, (payload) => {
-        if (payload.new.sender_id === window.surfActiveRecipientId) displayMessage(payload.new, findPerson(payload.new.sender_id));
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'direct_messages', filter: `recipient_id=eq.${window.surfCurrentUserId}` }, async (payload) => {
+        const person = findPerson(payload.new.sender_id);
+        const isOpen = payload.new.sender_id === window.surfActiveRecipientId;
+        await markMessagesDelivered([payload.new], isOpen);
+        const now = new Date().toISOString();
+        if (isOpen) displayMessage({ ...payload.new, delivered_at: now, read_at: isOpen && localReadReceiptsEnabled() ? now : null }, person);
         renderChatList();
         scheduleNotificationRefresh();
       }).on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'group_messages' }, (payload) => {
         if (payload.new.group_id === window.surfActiveGroupId && payload.new.sender_id !== window.surfCurrentUserId) displayMessage(payload.new, { username: 'Member' });
       }).on('postgres_changes', { event: '*', schema: 'public', table: 'friend_requests', filter: 'addressee_id=eq.' + window.surfCurrentUserId }, () => { scheduleNotificationRefresh(); scheduleRelationshipRefresh(); })
         .on('postgres_changes', { event: '*', schema: 'public', table: 'friend_requests', filter: 'requester_id=eq.' + window.surfCurrentUserId }, () => { scheduleNotificationRefresh(); scheduleRelationshipRefresh(); })
+        .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'direct_messages', filter: `sender_id=eq.${window.surfCurrentUserId}` }, (payload) => {
+          if (payload.new.recipient_id !== window.surfActiveRecipientId) return;
+          const person = findPerson(payload.new.recipient_id); if (person) loadDirectMessages(person);
+        })
         .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'story_likes' }, async (payload) => {
           scheduleNotificationRefresh();
           const current = activeStoryCollection?.[activeStoryIndex];
@@ -741,10 +789,11 @@
     storyAvatar.style.backgroundImage = storyAvatarUrl ? `url("${storyAvatarUrl}")` : '';
     document.getElementById('storyViewerCount').textContent = `${activeStoryIndex + 1} / ${activeStoryCollection.length}`;
     const progress = document.getElementById('storyProgress');
+    const progressSequence = ++storyProgressSequence;
     progress.style.setProperty('--story-progress', '0%');
     progress.classList.remove('is-advancing');
     void progress.offsetWidth;
-    requestAnimationFrame(() => progress.classList.add('is-advancing'));
+    requestAnimationFrame(() => { if (progressSequence === storyProgressSequence) progress.classList.add('is-advancing'); });
     storyAdvanceTimer = setTimeout(() => {
       if (activeStoryIndex < activeStoryCollection.length - 1) stepLiveStory(1);
       else closeModal('storyViewer');
@@ -753,6 +802,8 @@
     document.querySelector('.story-next').style.display = activeStoryIndex < activeStoryCollection.length - 1 ? 'grid' : 'none';
     const isOwnStory = activeStoryProfile?.id === window.surfCurrentUserId;
     document.querySelector('.story-viewer-add').style.display = isOwnStory ? 'block' : 'none';
+    document.getElementById('storyOwnMoreButton').style.display = isOwnStory ? 'grid' : 'none';
+    document.getElementById('storyOwnMenu').style.display = 'none';
     document.getElementById('storyLikeButton').style.display = isOwnStory ? 'none' : 'inline-flex';
     document.getElementById('storyReplyButton').style.display = isOwnStory ? 'none' : 'inline-flex';
     document.getElementById('storyLikeButton').classList.toggle('liked', likedStoryIds.has(story.id));
@@ -832,6 +883,32 @@
     if (error) return safeError(error, 'Could not add this story to highlights.');
     try { await loadStoryHighlights(); } catch (loadError) { console.warn(loadError); }
     toast('Added to highlights.');
+  }
+
+  function toggleStoryOwnMenu(event) {
+    event?.stopPropagation();
+    const menu = document.getElementById('storyOwnMenu');
+    menu.style.display = menu.style.display === 'flex' ? 'none' : 'flex';
+  }
+
+  async function archiveCurrentStory() {
+    const story = activeStoryCollection?.[activeStoryIndex];
+    if (!story || activeStoryProfile?.id !== window.surfCurrentUserId) return;
+    const { error } = await db.from('stories').update({ expires_at: new Date().toISOString() }).eq('id', story.id).eq('owner_id', window.surfCurrentUserId);
+    if (error) return safeError(error, 'Could not archive this story.');
+    clearTimeout(storyAdvanceTimer); closeModal('storyViewer');
+    await loadStories(); toast('Story moved to your archive.');
+  }
+
+  async function deleteCurrentStory() {
+    const story = activeStoryCollection?.[activeStoryIndex];
+    if (!story || activeStoryProfile?.id !== window.surfCurrentUserId) return;
+    if (!confirm('Delete this story? This cannot be undone.')) return;
+    const { error } = await db.from('stories').delete().eq('id', story.id).eq('owner_id', window.surfCurrentUserId);
+    if (error) return safeError(error, 'Could not delete this story.');
+    if (story.media_path) await db.storage.from('surf-stories').remove([story.media_path]);
+    clearTimeout(storyAdvanceTimer); closeModal('storyViewer');
+    await loadStories(); toast('Story deleted.');
   }
 
   async function replyToStory() {
@@ -1299,11 +1376,27 @@
   window.openPostComposer = openPostComposer;
   window.publishPost = publishPost;
   window.replyToStory = replyToStory;
+  window.toggleStoryOwnMenu = toggleStoryOwnMenu;
+  window.archiveCurrentStory = archiveCurrentStory;
+  window.deleteCurrentStory = deleteCurrentStory;
   window.renderAllStories = renderAllLiveStories;
   window.openAllStories = () => { renderAllLiveStories(); openModal('storiesPage'); };
   window.openFriendStory = (name) => { const entry = storySets.find((item) => item.owner.display_name === name || item.owner.username === name); if (entry) openLiveStory(entry); };
   window.shareStoryDraft = shareLiveStory;
   window.saveProfileSettings = saveLiveProfile;
+  const baseSavePreference = window.savePreference;
+  window.savePreference = function(key, value) {
+    baseSavePreference?.(key, value);
+    if (key !== 'readReceipts' || !window.surfCurrentUserId) return;
+    const enabled = Boolean(value);
+    selfProfile = { ...selfProfile, read_receipts_enabled: enabled };
+    db.from('profiles').update({ read_receipts_enabled: enabled }).eq('id', window.surfCurrentUserId)
+      .then(({ error }) => { if (error) safeError(error, 'Could not save read receipt preference.'); });
+    if (window.surfActiveRecipientId) {
+      const person = findPerson(window.surfActiveRecipientId);
+      if (person) loadDirectMessages(person);
+    }
+  };
   window.syncGroupPicker = syncGroupPicker;
   window.openCreateGroupModal = openLiveCreateGroup;
   document.getElementById('postMediaInput')?.addEventListener('change', (event) => {
