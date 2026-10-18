@@ -1124,7 +1124,7 @@
       card.tabIndex = 0; card.setAttribute('role','button'); card.setAttribute('aria-label','Open post');
       card.onclick = (event) => { if (event.target.closest('button,video')) return; openPostDetail(post, signed?.signedUrl); };
       if (ownerId === window.surfCurrentUserId) { const del = document.createElement('button'); del.type='button'; del.className='delete-post-button'; del.textContent='Delete'; del.onclick=(event)=>{event.stopPropagation();deleteOwnPost(post);}; card.append(del); }
-      const save = document.createElement('button'); save.type = 'button'; save.className = 'save-post-button'; save.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4.5h12v16l-6-4-6 4z"/></svg><span>Save</span>'; save.setAttribute('aria-label', 'Save post'); save.onclick = () => toggleSavedPost(post.id, save); card.append(save); target.append(card);
+      target.append(card);
     }
     if (!visiblePosts.length) setEmpty(target, view === 'videos' ? 'No videos yet.' : view === 'tagged' ? 'No tagged posts yet.' : 'No posts yet.');
     if (ownerId === window.surfCurrentUserId) updateOwnCounts();
@@ -1593,11 +1593,16 @@
   function bindProfileImageUploads() {
     const avatarInput = document.getElementById('pfpInput');
     const bannerInput = document.getElementById('bannerInput');
-    if (avatarInput && !avatarInput.dataset.liveUploadBound) { avatarInput.dataset.liveUploadBound = '1'; avatarInput.addEventListener('change', (event) => { pendingProfileImage = event.target.files?.[0] ? { file: event.target.files[0], kind: 'avatar' } : null; }); }
-    if (bannerInput && !bannerInput.dataset.liveUploadBound) { bannerInput.dataset.liveUploadBound = '1'; bannerInput.addEventListener('change', (event) => { pendingProfileImage = event.target.files?.[0] ? { file: event.target.files[0], kind: 'banner' } : null; }); }
+    if (avatarInput && !avatarInput.dataset.liveUploadBound) { avatarInput.dataset.liveUploadBound = '1'; avatarInput.addEventListener('change', (event) => { pendingProfileImage = event.target.files?.[0] ? { file: event.target.files[0], kind: 'avatar' } : null; }, true); }
+    if (bannerInput && !bannerInput.dataset.liveUploadBound) { bannerInput.dataset.liveUploadBound = '1'; bannerInput.addEventListener('change', (event) => { pendingProfileImage = event.target.files?.[0] ? { file: event.target.files[0], kind: 'banner' } : null; }, true); }
     const crop = window.saveCrop;
     window.saveCrop = async function() {
       const pending = pendingProfileImage; pendingProfileImage = null;
+      if (pending && !window.surfCurrentUserId) {
+        pendingProfileImage = pending;
+        toast('Please sign in again before saving your profile image.');
+        return;
+      }
       let task = null;
       try { if (typeof cropTask !== 'undefined') task = cropTask; } catch { /* Crop state is not available. */ }
       crop();
