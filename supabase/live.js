@@ -12,6 +12,8 @@
   let activeStoryProfile = null;
   let activeStoryViewId = null;
   let storyAdvanceTimer = null;
+  let postDraftFile = null;
+  let archivedStories = [];
   const likedStoryIds = new Set();
   let selfProfile = null;
   let activeFriendTab = 'all';
@@ -313,6 +315,7 @@
           if (current?.id === payload.new.story_id && activeStoryProfile?.id === window.surfCurrentUserId) refreshStoryViewerCount(current.id);
         })
         .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'stories' }, () => scheduleNotificationRefresh())
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'posts' }, () => scheduleNotificationRefresh())
         .subscribe();
   }
 
@@ -575,7 +578,7 @@
     const list = document.getElementById('notificationsList');
     if (!list) return;
     list.replaceChildren();
-    if (!notificationItems.length) return setEmpty(list, 'You’re all caught up. Friend requests and story likes will show here.');
+    if (!notificationItems.length) return setEmpty(list, 'You’re all caught up. Friend requests, friends’ posts, and story likes will show here.');
     const lastSeen = Date.parse(localStorage.getItem(notificationSeenKey()) || '');
     notificationItems.forEach((item) => {
       const row = document.createElement('button');
@@ -600,14 +603,17 @@
     const seenKey = notificationSeenKey();
     if (!localStorage.getItem(seenKey)) localStorage.setItem(seenKey, new Date().toISOString());
     const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-    const [requestResult, likeResult] = await Promise.all([
+    const [requestResult, likeResult, postResult] = await Promise.all([
       db.from('friend_requests').select('id,requester_id,addressee_id,status,created_at,updated_at').eq('addressee_id', userId).eq('status', 'pending').gte('created_at', since).order('created_at', { ascending: false }).limit(40),
-      db.from('story_likes').select('id,story_id,user_id,created_at').gte('created_at', since).order('created_at', { ascending: false }).limit(60)
+      db.from('story_likes').select('id,story_id,user_id,created_at').gte('created_at', since).order('created_at', { ascending: false }).limit(60),
+      db.from('posts').select('id,owner_id,created_at').gte('created_at', since).order('created_at', { ascending: false }).limit(80)
     ]);
-    const failed = [requestResult, likeResult].find((result) => result.error);
+    const failed = [requestResult, likeResult, postResult].find((result) => result.error);
     if (failed) return safeError(failed.error, 'Could not load notifications.');
     const actors = [];
     (requestResult.data || []).forEach((row) => actors.push({ id: row.requester_id, kind: 'request', row, created_at: row.created_at, text: 'sent you a friend request' }));
+    const friendIds = new Set(friends.filter((person) => person.relation.status === 'accepted').map((person) => person.id));
+    (postResult.data || []).filter((row) => row.owner_id !== userId && friendIds.has(row.owner_id)).forEach((row) => actors.push({ id: row.owner_id, kind: 'post', row, created_at: row.created_at, text: 'shared a new post' }));
     const likes = (likeResult.data || []).filter((row) => row.user_id !== userId);
     if (likes.length) {
       const storyIds = [...new Set(likes.map((row) => row.story_id))];
@@ -649,6 +655,7 @@
       return;
     }
     if (item.kind === 'request') return openLiveProfile({ ...actor, ...(friends.find((friend) => friend.id === actor.id) || {}) });
+    if (item.kind === 'post') return openLiveProfile({ ...actor, ...(friends.find((friend) => friend.id === actor.id) || {}) });
   }
 
   function renderStoriesStrip() {
@@ -746,9 +753,8 @@
     document.querySelector('.story-next').style.display = activeStoryIndex < activeStoryCollection.length - 1 ? 'grid' : 'none';
     const isOwnStory = activeStoryProfile?.id === window.surfCurrentUserId;
     document.querySelector('.story-viewer-add').style.display = isOwnStory ? 'block' : 'none';
-    document.getElementById('storyViewersButton').style.display = isOwnStory ? 'inline-flex' : 'none';
-    document.getElementById('storyHighlightButton').style.display = isOwnStory ? 'inline-flex' : 'none';
     document.getElementById('storyLikeButton').style.display = isOwnStory ? 'none' : 'inline-flex';
+    document.getElementById('storyReplyButton').style.display = isOwnStory ? 'none' : 'inline-flex';
     document.getElementById('storyLikeButton').classList.toggle('liked', likedStoryIds.has(story.id));
     if (story.id !== activeStoryViewId) { activeStoryViewId = story.id; recordStoryView(story.id); }
     if (isOwnStory) refreshStoryViewerCount(story.id);
@@ -787,6 +793,117 @@
       const row = document.createElement('div'); row.className = 'story-viewer-person';
       row.append(avatarNode(person)); const name = document.createElement('span'); name.textContent = person.display_name || person.username; row.append(name); list.append(row);
     });
+  }
+
+  async function openStoryArchive() {
+    openModal('storyArchiveModal');
+    try { await loadStoryHighlights(); } catch (error) { safeError(error, 'Could not load story highlights.'); }
+    const list = document.getElementById('storyArchiveList'); list.replaceChildren();
+    const { data, error } = await db.from('stories').select('*').eq('owner_id', window.surfCurrentUserId).order('created_at', { ascending: false });
+    if (error) return safeError(error, 'Could not load your story archive.');
+    archivedStories = data || [];
+    if (!archivedStories.length) return setEmpty(list, 'Stories you share will be saved here after they expire.');
+    for (const story of archivedStories) {
+      if (story.media_path) {
+        const { data: signed } = await db.storage.from('surf-stories').createSignedUrl(story.media_path, 3600);
+        story.url = signed?.signedUrl || '';
+      }
+      const row = document.createElement('article'); row.className = 'archive-story-row';
+      const preview = document.createElement('button'); preview.type = 'button'; preview.className = 'archive-story-preview';
+      if (story.url) { const image = document.createElement('img'); image.src = story.url; image.alt = 'Archived story'; preview.append(image); }
+      else { preview.textContent = story.body || 'Text story'; preview.style.background = story.background_color || '#51419b'; }
+      preview.onclick = () => { closeModal('storyArchiveModal'); openLiveStory({ owner: selfProfile, items: [story], isYours: true }); };
+      const actions = document.createElement('div'); actions.className = 'archive-story-actions';
+      const viewers = document.createElement('button'); viewers.type = 'button'; viewers.textContent = 'Viewers'; viewers.onclick = () => openStoryViewersFor(story.id);
+      const highlight = document.createElement('button'); highlight.type = 'button'; highlight.textContent = '＋ Highlight'; highlight.onclick = () => addStoryToHighlight(story);
+      actions.append(viewers, highlight); row.append(preview, actions); list.append(row);
+    }
+  }
+
+  async function openStoryViewersFor(storyId) {
+    const story = archivedStories.find((item) => item.id === storyId); if (!story) return;
+    activeStoryCollection = [story]; activeStoryProfile = selfProfile; activeStoryIndex = 0;
+    return openStoryViewers();
+  }
+
+  async function addStoryToHighlight(story) {
+    const title = (prompt('Name this highlight:', 'Highlights') || '').trim(); if (!title) return;
+    const { error } = await db.from('story_highlights').insert({ owner_id: window.surfCurrentUserId, story_id: story.id, title });
+    if (error) return safeError(error, 'Could not add this story to highlights.');
+    try { await loadStoryHighlights(); } catch (loadError) { console.warn(loadError); }
+    toast('Added to highlights.');
+  }
+
+  async function replyToStory() {
+    const reply = (prompt('Reply to this story:') || '').trim(); if (!reply) return;
+    const recipient = activeStoryProfile?.id;
+    if (!recipient || recipient === window.surfCurrentUserId) return toast('You can reply to a friend’s story.');
+    const chatRow = document.querySelector(`#chatList [data-user-id="${recipient}"]`);
+    if (!chatRow) return toast('Add this person as a friend before replying.');
+    closeModal('storyViewer'); selectLivePerson(chatRow, activeStoryProfile); await sendLiveMessage(reply);
+  }
+
+  function openPostComposer() {
+    if (!window.surfCurrentUserId) return toast('Sign in to create a post.');
+    postDraftFile = null; document.getElementById('postMediaInput').value = '';
+    document.getElementById('postCaption').value = ''; document.getElementById('postTags').value = '';
+    document.getElementById('postMediaPreview').textContent = 'No media selected'; openModal('postComposerModal');
+  }
+
+  async function publishPost() {
+    const file = postDraftFile; if (!file) return toast('Choose a photo or video first.');
+    const caption = document.getElementById('postCaption').value.trim();
+    const postId = crypto.randomUUID(); const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(-90) || 'post-media';
+    const path = `${window.surfCurrentUserId}/${postId}/${safeName}`;
+    const { error: uploadError } = await db.storage.from('surf-post-media').upload(path, file, { contentType: file.type, upsert: false });
+    if (uploadError) return safeError(uploadError, 'Could not upload this post.');
+    const mediaType = file.type.startsWith('video/') ? 'video' : 'image';
+    const { error } = await db.from('posts').insert({ id: postId, owner_id: window.surfCurrentUserId, media_path: path, media_type: mediaType, caption });
+    if (error) { await db.storage.from('surf-post-media').remove([path]); return safeError(error, 'Could not save this post.'); }
+    const tags = [...new Set(document.getElementById('postTags').value.split(',').map((name) => name.trim().replace(/^@/, '').toLowerCase()).filter(Boolean))];
+    if (tags.length) {
+      const { data: people, error: peopleError } = await db.from('profiles').select('id,username').in('username', tags);
+      if (peopleError) safeError(peopleError, 'Post shared, but tags could not be looked up.');
+      else if (people?.length) { const tagResult = await db.from('post_tags').insert(people.map((person) => ({ post_id: postId, tagged_user_id: person.id, tagged_by: window.surfCurrentUserId }))); if (tagResult.error) safeError(tagResult.error, 'Post shared, but tags could not be saved.'); }
+    }
+    closeModal('postComposerModal'); await loadProfilePosts(window.surfCurrentUserId); await updateOwnCounts(); toast('Post shared.');
+  }
+
+  async function loadProfilePosts(ownerId, target = document.getElementById('profileGrid')) {
+    if (!ownerId || !target) return;
+    const { data: posts, error } = await db.from('posts').select('*').eq('owner_id', ownerId).order('created_at', { ascending: false });
+    if (error) return safeError(error, 'Could not load posts.');
+    target.replaceChildren();
+    for (const post of posts || []) {
+      const { data: signed } = await db.storage.from('surf-post-media').createSignedUrl(post.media_path, 3600);
+      const card = document.createElement('article'); card.className = 'grid-post surf-post-card';
+      if (signed?.signedUrl && post.media_type === 'video') { const video = document.createElement('video'); video.src = signed.signedUrl; video.controls = true; card.append(video); }
+      else if (signed?.signedUrl) { const image = document.createElement('img'); image.src = signed.signedUrl; image.alt = post.caption || 'Surf post'; card.append(image); }
+      const caption = document.createElement('p'); caption.textContent = post.caption; card.append(caption);
+      const save = document.createElement('button'); save.type = 'button'; save.className = 'save-post-button'; save.textContent = '♡ Save'; save.onclick = () => toggleSavedPost(post.id, save); card.append(save); target.append(card);
+    }
+    if (!(posts || []).length) setEmpty(target, 'No posts yet.');
+    const count = document.querySelector('.stats span:first-child b'); if (ownerId === window.surfCurrentUserId && count) count.textContent = String(posts?.length || 0);
+  }
+
+  async function toggleSavedPost(postId, button) {
+    const userId = window.surfCurrentUserId;
+    const { data, error } = await db.from('saved_posts').select('post_id').eq('user_id', userId).eq('post_id', postId).maybeSingle();
+    if (error) return safeError(error, 'Could not check saved posts.');
+    const result = data ? await db.from('saved_posts').delete().eq('user_id', userId).eq('post_id', postId) : await db.from('saved_posts').insert({ user_id: userId, post_id: postId });
+    if (result.error) return safeError(result.error, 'Could not update saved posts.');
+    button.textContent = data ? '♡ Save' : '♥ Saved';
+  }
+
+  async function openSavedPosts() {
+    openModal('savedPostsModal'); const list = document.getElementById('savedPostsList'); list.replaceChildren();
+    const { data, error } = await db.from('saved_posts').select('post_id').eq('user_id', window.surfCurrentUserId).order('created_at', { ascending: false });
+    if (error) return safeError(error, 'Could not load saved posts.');
+    const ids = (data || []).map((item) => item.post_id); if (!ids.length) return setEmpty(list, 'Posts you save will appear here.');
+    const { data: posts, error: postError } = await db.from('posts').select('*').in('id', ids);
+    if (postError) return safeError(postError, 'Could not load saved posts.');
+    list.className = 'saved-post-grid';
+    for (const post of posts || []) { const { data: signed } = await db.storage.from('surf-post-media').createSignedUrl(post.media_path, 3600); if (!signed?.signedUrl) continue; const card = document.createElement('article'); card.className = 'grid-post surf-post-card'; if (post.media_type === 'video') { const video = document.createElement('video'); video.src = signed.signedUrl; video.controls = true; card.append(video); } else { const image = document.createElement('img'); image.src = signed.signedUrl; card.append(image); } const caption = document.createElement('p'); caption.textContent = post.caption; card.append(caption); list.append(card); }
   }
 
   function animateStoryLike(person) {
@@ -936,7 +1053,7 @@
   async function updateOwnCounts() {
     const id = window.surfCurrentUserId;
     const accepted = friends.filter((person) => person.relation.status === 'accepted').length;
-    const { count } = await db.from('stories').select('id', { count: 'exact', head: true }).eq('owner_id', id).gt('expires_at', new Date().toISOString());
+    const { count } = await db.from('posts').select('id', { count: 'exact', head: true }).eq('owner_id', id);
     const values = document.querySelectorAll('.stats b');
     if (values[0]) values[0].textContent = String(count || 0);
     if (values[1]) values[1].textContent = String(accepted);
@@ -1094,6 +1211,7 @@
     window.showProfilePage = function() {
       originalShowProfilePage();
       const person = activeProfile || selfProfile;
+      if (person?.id) loadProfilePosts(person.id);
       const pageAvatar = document.getElementById('pageAvatar');
       const avatarUrl = profileAssetUrl(person?.avatar_path);
       if (pageAvatar) {
@@ -1129,6 +1247,7 @@
       document.querySelectorAll('#profilePage .profile-stats b').forEach((item) => { item.textContent = '0'; });
       document.getElementById('profilePage').style.display = 'block';
       applyProfileAssets(selfProfile);
+      loadProfilePosts(selfProfile.id);
       const age = document.getElementById('pageAgeBadge');
       if (age) { age.textContent = selfProfile.is_minor ? '🧒 Minor' : '18+'; age.style.display = 'inline-flex'; }
       renderSocialLinks(document.getElementById('pageSocialLinks'), selfProfile.social_links);
@@ -1175,7 +1294,11 @@
   window.handleYourStoryClick = () => { if (yourStories.length) openLiveStory({ owner: selfProfile, items: yourStories, isYours: true }); else { resetStoryComposer(); openModal('storyModal'); } };
   window.openStoryViewers = openStoryViewers;
   window.toggleStoryLike = toggleStoryLike;
-  window.addStoryHighlight = addStoryHighlight;
+  window.openStoryArchive = openStoryArchive;
+  window.openSavedPosts = openSavedPosts;
+  window.openPostComposer = openPostComposer;
+  window.publishPost = publishPost;
+  window.replyToStory = replyToStory;
   window.renderAllStories = renderAllLiveStories;
   window.openAllStories = () => { renderAllLiveStories(); openModal('storiesPage'); };
   window.openFriendStory = (name) => { const entry = storySets.find((item) => item.owner.display_name === name || item.owner.username === name); if (entry) openLiveStory(entry); };
@@ -1183,6 +1306,14 @@
   window.saveProfileSettings = saveLiveProfile;
   window.syncGroupPicker = syncGroupPicker;
   window.openCreateGroupModal = openLiveCreateGroup;
+  document.getElementById('postMediaInput')?.addEventListener('change', (event) => {
+    postDraftFile = event.target.files?.[0] || null;
+    const preview = document.getElementById('postMediaPreview'); preview.replaceChildren();
+    if (!postDraftFile) { preview.textContent = 'No media selected'; return; }
+    const url = URL.createObjectURL(postDraftFile);
+    if (postDraftFile.type.startsWith('video/')) { const video = document.createElement('video'); video.src = url; video.controls = true; preview.append(video); }
+    else { const image = document.createElement('img'); image.src = url; image.alt = 'Post preview'; preview.append(image); }
+  });
   window.createGroup = createLiveGroup;
   window.openAddFriend = () => { openModal('discoverModal'); setTimeout(() => document.getElementById('discoverInput')?.focus(), 80); };
   window.addFriendDemo = addLiveFriend;
@@ -1208,7 +1339,7 @@
   document.querySelector('.chats-head .section-label').textContent = 'Friends & chats';
   document.querySelector('.auth-note')?.replaceChildren(document.createTextNode('Your account is secured by Surf and Supabase.'));
   document.getElementById('profileCardPosts') && (document.getElementById('profileCardPosts').textContent = '0');
-  document.querySelector('.stats')?.replaceChildren(...['Stories','Friends','Following'].map((label) => { const item=document.createElement('div'),value=document.createElement('b');value.textContent='0';item.append(value,document.createTextNode(label));return item; }));
+  document.querySelector('.stats')?.replaceChildren(...['Posts','Friends','Following'].map((label) => { const item=document.createElement('div'),value=document.createElement('b');value.textContent='0';item.append(value,document.createTextNode(label));return item; }));
   document.querySelector('.right-title')?.parentElement?.insertAdjacentHTML('afterend', '<p class="friends-empty">Your shared media will appear here.</p>');
   document.querySelector('.chat-top .top-actions')?.setAttribute('style', 'display:none');
   document.getElementById('composer')?.querySelectorAll('input,button').forEach((item) => { item.disabled = true; });
