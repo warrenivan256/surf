@@ -7,7 +7,11 @@
   let requests = [];
   let groups = [];
   let storySets = [];
+  let highlightSets = [];
   let activeProfile = null;
+  let activeStoryProfile = null;
+  let activeStoryViewId = null;
+  const likedStoryIds = new Set();
   let selfProfile = null;
   let activeFriendTab = 'all';
   let activeChannel = null;
@@ -296,6 +300,17 @@
         if (payload.new.group_id === window.surfActiveGroupId && payload.new.sender_id !== window.surfCurrentUserId) displayMessage(payload.new, { username: 'Member' });
       }).on('postgres_changes', { event: '*', schema: 'public', table: 'friend_requests', filter: 'addressee_id=eq.' + window.surfCurrentUserId }, () => { scheduleNotificationRefresh(); scheduleRelationshipRefresh(); })
         .on('postgres_changes', { event: '*', schema: 'public', table: 'friend_requests', filter: 'requester_id=eq.' + window.surfCurrentUserId }, () => { scheduleNotificationRefresh(); scheduleRelationshipRefresh(); })
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'story_likes' }, async (payload) => {
+          scheduleNotificationRefresh();
+          const current = activeStoryCollection?.[activeStoryIndex];
+          if (current?.id !== payload.new.story_id || payload.new.user_id === window.surfCurrentUserId) return;
+          const { data: liker } = await db.from('profiles').select('id,username,display_name,avatar_path').eq('id', payload.new.user_id).maybeSingle();
+          if (liker) animateStoryLike(liker);
+        })
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'story_views' }, (payload) => {
+          const current = activeStoryCollection?.[activeStoryIndex];
+          if (current?.id === payload.new.story_id && activeStoryProfile?.id === window.surfCurrentUserId) refreshStoryViewerCount(current.id);
+        })
         .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'stories' }, () => scheduleNotificationRefresh())
         .subscribe();
   }
@@ -559,7 +574,7 @@
     const list = document.getElementById('notificationsList');
     if (!list) return;
     list.replaceChildren();
-    if (!notificationItems.length) return setEmpty(list, 'You’re all caught up. New messages, follow requests, and friends’ stories will show here.');
+    if (!notificationItems.length) return setEmpty(list, 'You’re all caught up. Friend requests and story likes will show here.');
     const lastSeen = Date.parse(localStorage.getItem(notificationSeenKey()) || '');
     notificationItems.forEach((item) => {
       const row = document.createElement('button');
@@ -584,24 +599,22 @@
     const seenKey = notificationSeenKey();
     if (!localStorage.getItem(seenKey)) localStorage.setItem(seenKey, new Date().toISOString());
     const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-    const [messageResult, requestResult, storyResult] = await Promise.all([
-      db.from('direct_messages').select('id,sender_id,body,created_at').eq('recipient_id', userId).neq('sender_id', userId).gte('created_at', since).order('created_at', { ascending: false }).limit(40),
-      db.from('friend_requests').select('id,requester_id,addressee_id,status,created_at,updated_at').or('requester_id.eq.' + userId + ',addressee_id.eq.' + userId).gte('updated_at', since).order('updated_at', { ascending: false }).limit(40),
-      db.from('stories').select('id,owner_id,kind,body,created_at,expires_at').neq('owner_id', userId).gt('expires_at', new Date().toISOString()).gte('created_at', since).order('created_at', { ascending: false }).limit(40)
+    const [requestResult, likeResult] = await Promise.all([
+      db.from('friend_requests').select('id,requester_id,addressee_id,status,created_at,updated_at').eq('addressee_id', userId).eq('status', 'pending').gte('created_at', since).order('created_at', { ascending: false }).limit(40),
+      db.from('story_likes').select('id,story_id,user_id,created_at').gte('created_at', since).order('created_at', { ascending: false }).limit(60)
     ]);
-    const failed = [messageResult, requestResult, storyResult].find((result) => result.error);
+    const failed = [requestResult, likeResult].find((result) => result.error);
     if (failed) return safeError(failed.error, 'Could not load notifications.');
-    const relationRows = requestResult.data || [];
-    const followedIds = new Set(relationRows.filter((rel) => rel.status === 'accepted').map((rel) => rel.requester_id === userId ? rel.addressee_id : rel.requester_id));
     const actors = [];
-    (messageResult.data || []).forEach((row) => actors.push({ id: row.sender_id, kind: 'message', row, created_at: row.created_at, text: 'sent you a message' }));
-    relationRows.forEach((row) => {
-      const incoming = row.addressee_id === userId && row.requester_id !== userId && row.status === 'pending';
-      const acceptedByOther = row.requester_id === userId && row.addressee_id !== userId && row.status === 'accepted' && row.updated_at > row.created_at;
-      if (incoming) actors.push({ id: row.requester_id, kind: 'request', row, created_at: row.updated_at, text: 'sent you a follow request' });
-      else if (acceptedByOther) actors.push({ id: row.addressee_id, kind: 'accepted', row, created_at: row.updated_at, text: 'accepted your follow request' });
-    });
-    (storyResult.data || []).filter((story) => followedIds.has(story.owner_id)).forEach((row) => actors.push({ id: row.owner_id, kind: 'story', row, created_at: row.created_at, text: 'shared a new story' }));
+    (requestResult.data || []).forEach((row) => actors.push({ id: row.requester_id, kind: 'request', row, created_at: row.created_at, text: 'sent you a friend request' }));
+    const likes = (likeResult.data || []).filter((row) => row.user_id !== userId);
+    if (likes.length) {
+      const storyIds = [...new Set(likes.map((row) => row.story_id))];
+      const { data: likedStories, error: storyError } = await db.from('stories').select('id,owner_id').in('id', storyIds).eq('owner_id', userId);
+      if (storyError) return safeError(storyError, 'Could not load story likes.');
+      const ownStoryIds = new Set((likedStories || []).map((story) => story.id));
+      likes.filter((row) => ownStoryIds.has(row.story_id)).forEach((row) => actors.push({ id: row.user_id, kind: 'story-like', row, created_at: row.created_at, text: 'liked your story' }));
+    }
     const ids = [...new Set(actors.map((item) => item.id))];
     let people = new Map();
     if (ids.length) {
@@ -628,16 +641,13 @@
     localStorage.setItem(notificationSeenKey(), new Date().toISOString());
     refreshNotifications(false);
     const actor = item.actor;
-    if (item.kind === 'story') {
+    if (item.kind === 'story-like') {
       await loadStories();
-      const entry = storySets.find((story) => story.owner.id === actor.id);
-      if (entry) openLiveStory(entry);
+      const index = yourStories.findIndex((story) => story.id === item.row.story_id);
+      if (index >= 0) { openLiveStory({ owner: selfProfile, items: yourStories, isYours: true }); activeStoryIndex = index; renderLiveStoryViewer(); }
       return;
     }
-    const row = document.querySelector('#chatList [data-user-id="' + actor.id + '"]');
-    if (item.kind === 'message' && row) return selectLivePerson(row, findPerson(actor.id));
-    if (item.kind === 'request' || item.kind === 'accepted') return openLiveProfile({ ...actor, ...(friends.find((friend) => friend.id === actor.id) || {}) });
-    if (item.kind === 'message') toast('Add this person as a friend to open the conversation.');
+    if (item.kind === 'request') return openLiveProfile({ ...actor, ...(friends.find((friend) => friend.id === actor.id) || {}) });
   }
 
   function renderStoriesStrip() {
@@ -647,20 +657,20 @@
     storySets.forEach((entry) => {
       const item = document.createElement('div'); item.className = 'story'; item.tabIndex = 0;
       const wrap = document.createElement('div'); wrap.className = 'avatar-wrap';
-      const avatar = document.createElement('span'); avatar.className = 'avatar'; avatar.textContent = initials(entry.owner); wrap.append(avatar);
+      const avatar = avatarNode(entry.owner); wrap.append(avatar);
       const name = document.createElement('span'); name.textContent = entry.owner.display_name || entry.owner.username;
       item.append(wrap, name); item.onclick = () => openLiveStory(entry); strip.append(item);
     });
   }
 
   async function loadStories() {
-    const { data, error } = await db.from('stories').select('*').gt('expires_at', new Date().toISOString()).order('created_at', { ascending: false });
+    const { data, error } = await db.from('stories').select('*').gt('expires_at', new Date().toISOString()).order('created_at', { ascending: true });
     if (error) throw error;
     const stories = data || [];
     const ownerIds = [...new Set(stories.map((story) => story.owner_id))];
     let profileMap = new Map();
     if (ownerIds.length) {
-      const { data: profiles, error: profileError } = await db.from('profiles').select('id,username,display_name,status').in('id', ownerIds);
+      const { data: profiles, error: profileError } = await db.from('profiles').select('id,username,display_name,status,avatar_path').in('id', ownerIds);
       if (profileError) throw profileError;
       profileMap = new Map((profiles || []).map((profile) => [profile.id, profile]));
     }
@@ -694,12 +704,20 @@
     });
     storySets = [...grouped.values()];
     renderStoriesStrip();
+    try { await loadStoryHighlights(); } catch (highlightError) { console.warn('Could not load saved highlights.', highlightError); }
   }
 
-  function openLiveStory(entry) {
+  async function openLiveStory(entry) {
     activeStoryCollection = entry.items; activeStoryOwner = entry.isYours ? 'Your story' : entry.owner.display_name || entry.owner.username;
-    activeStoryEmoji = initials(entry.owner || {}); activeStoryIndex = 0;
-    renderStoryViewer(); openModal('storyViewer');
+    activeStoryProfile = entry.isYours ? selfProfile : entry.owner;
+    activeStoryEmoji = initials(activeStoryProfile || entry.owner || {}); activeStoryIndex = 0; activeStoryViewId = null;
+    likedStoryIds.clear();
+    renderLiveStoryViewer(); openModal('storyViewer');
+    if (window.surfCurrentUserId && entry.items.length) {
+      const { data } = await db.from('story_likes').select('story_id').eq('user_id', window.surfCurrentUserId).in('story_id', entry.items.map((story) => story.id));
+      (data || []).forEach((like) => likedStoryIds.add(like.story_id));
+      renderLiveStoryViewer();
+    }
   }
 
   function renderLiveStoryViewer() {
@@ -709,12 +727,123 @@
     if (story.kind === 'image') { image.src = story.url; text.textContent = ''; }
     else { text.textContent = story.body; text.style.background = story.background_color; }
     document.getElementById('storyViewerName').textContent = activeStoryOwner;
-    document.getElementById('storyViewerAvatar').textContent = activeStoryEmoji;
+    const storyAvatar = document.getElementById('storyViewerAvatar'), storyAvatarUrl = profileAssetUrl(activeStoryProfile?.avatar_path);
+    storyAvatar.textContent = storyAvatarUrl ? '' : activeStoryEmoji;
+    storyAvatar.style.backgroundImage = storyAvatarUrl ? `url("${storyAvatarUrl}")` : '';
     document.getElementById('storyViewerCount').textContent = `${activeStoryIndex + 1} / ${activeStoryCollection.length}`;
-    document.getElementById('storyViewerMeta').textContent = story.expires_at ? `Expires ${new Date(story.expires_at).toLocaleString()}` : 'Just now · expires in 24 hours';
+    document.getElementById('storyProgress').style.setProperty('--story-progress', `${((activeStoryIndex + 1) / activeStoryCollection.length) * 100}%`);
     document.querySelector('.story-prev').style.display = activeStoryIndex > 0 ? 'grid' : 'none';
     document.querySelector('.story-next').style.display = activeStoryIndex < activeStoryCollection.length - 1 ? 'grid' : 'none';
-    document.querySelector('.story-viewer-add').style.display = activeStoryOwner === 'Your story' ? 'block' : 'none';
+    const isOwnStory = activeStoryProfile?.id === window.surfCurrentUserId;
+    document.querySelector('.story-viewer-add').style.display = isOwnStory ? 'block' : 'none';
+    document.getElementById('storyViewersButton').style.display = isOwnStory ? 'inline-flex' : 'none';
+    document.getElementById('storyHighlightButton').style.display = isOwnStory ? 'inline-flex' : 'none';
+    document.getElementById('storyLikeButton').style.display = isOwnStory ? 'none' : 'inline-flex';
+    document.getElementById('storyLikeButton').classList.toggle('liked', likedStoryIds.has(story.id));
+    if (story.id !== activeStoryViewId) { activeStoryViewId = story.id; recordStoryView(story.id); }
+    if (isOwnStory) refreshStoryViewerCount(story.id);
+  }
+
+  async function stepLiveStory(direction) {
+    if (!activeStoryCollection?.length) return;
+    const next = activeStoryIndex + direction;
+    if (next < 0 || next >= activeStoryCollection.length) return;
+    activeStoryIndex = next; activeStoryViewId = null; renderLiveStoryViewer();
+  }
+
+  async function recordStoryView(storyId) {
+    if (!storyId || !window.surfCurrentUserId || activeStoryProfile?.id === window.surfCurrentUserId) return;
+    const { error } = await db.from('story_views').upsert({ story_id: storyId, viewer_id: window.surfCurrentUserId }, { onConflict: 'story_id,viewer_id', ignoreDuplicates: true });
+    if (error) console.warn('Could not record story view.', error);
+  }
+
+  async function refreshStoryViewerCount(storyId) {
+    const { count, error } = await db.from('story_views').select('viewer_id', { count: 'exact', head: true }).eq('story_id', storyId);
+    if (!error) document.getElementById('storyViewerTotal').textContent = String(count || 0);
+  }
+
+  async function openStoryViewers() {
+    const story = activeStoryCollection?.[activeStoryIndex];
+    if (!story || activeStoryProfile?.id !== window.surfCurrentUserId) return;
+    const list = document.getElementById('storyViewersList'); list.replaceChildren();
+    openModal('storyViewersModal');
+    const { data: views, error } = await db.from('story_views').select('viewer_id').eq('story_id', story.id);
+    if (error) return safeError(error, 'Could not load story viewers.');
+    const ids = [...new Set((views || []).map((view) => view.viewer_id))];
+    if (!ids.length) return setEmpty(list, 'No viewers yet.');
+    const { data: people, error: profileError } = await db.from('profiles').select('id,username,display_name,avatar_path').in('id', ids);
+    if (profileError) return safeError(profileError, 'Could not load viewer profiles.');
+    (people || []).forEach((person) => {
+      const row = document.createElement('div'); row.className = 'story-viewer-person';
+      row.append(avatarNode(person)); const name = document.createElement('span'); name.textContent = person.display_name || person.username; row.append(name); list.append(row);
+    });
+  }
+
+  function animateStoryLike(person) {
+    const floater = document.createElement('div'); floater.className = 'story-like-float';
+    const url = profileAssetUrl(person?.avatar_path);
+    if (url) { const img = document.createElement('img'); img.src = url; img.alt = ''; floater.append(img); }
+    else { const initialsNode = document.createElement('b'); initialsNode.textContent = initials(person || {}); floater.append(initialsNode); }
+    document.querySelector('.story-viewer')?.append(floater); setTimeout(() => floater.remove(), 1500);
+  }
+
+  async function toggleStoryLike() {
+    const story = activeStoryCollection?.[activeStoryIndex];
+    if (!story || !window.surfCurrentUserId) return;
+    if (likedStoryIds.has(story.id)) {
+      const { error } = await db.from('story_likes').delete().eq('story_id', story.id).eq('user_id', window.surfCurrentUserId);
+      if (error) return safeError(error, 'Could not remove your story like.');
+      likedStoryIds.delete(story.id);
+    } else {
+      const { error } = await db.from('story_likes').upsert({ story_id: story.id, user_id: window.surfCurrentUserId }, { onConflict: 'story_id,user_id', ignoreDuplicates: true });
+      if (error) return safeError(error, 'Could not like this story.');
+      likedStoryIds.add(story.id); animateStoryLike(selfProfile);
+    }
+    renderLiveStoryViewer(); scheduleNotificationRefresh();
+  }
+
+  async function addStoryHighlight() {
+    const story = activeStoryCollection?.[activeStoryIndex];
+    if (!story || activeStoryProfile?.id !== window.surfCurrentUserId) return;
+    const title = (prompt('Name this highlight:', 'Highlights') || '').trim();
+    if (!title) return;
+    const { error } = await db.from('story_highlights').insert({ owner_id: window.surfCurrentUserId, story_id: story.id, title });
+    if (error) return safeError(error, 'Could not add this story to highlights.');
+    await loadStoryHighlights(); toast('Added to highlights.');
+  }
+
+  async function loadStoryHighlights() {
+    const list = document.getElementById('storyHighlightsList'); if (!list) return;
+    const { data: saved, error } = await db.from('story_highlights').select('id,owner_id,story_id,title,created_at').order('created_at', { ascending: true });
+    if (error) throw error;
+    const ids = [...new Set((saved || []).map((item) => item.story_id))];
+    if (!ids.length) { highlightSets = []; list.innerHTML = '<p class="friends-empty">Your saved story highlights will appear here.</p>'; return; }
+    const [{ data: stories, error: storiesError }, { data: profiles, error: profilesError }] = await Promise.all([
+      db.from('stories').select('*').in('id', ids).order('created_at', { ascending: true }),
+      db.from('profiles').select('id,username,display_name,avatar_path').in('id', [...new Set(saved.map((item) => item.owner_id))])
+    ]);
+    if (storiesError) throw storiesError; if (profilesError) throw profilesError;
+    const storyById = new Map((stories || []).map((story) => [story.id, story]));
+    const profileById = new Map((profiles || []).map((person) => [person.id, person]));
+    const groups = new Map();
+    for (const item of saved) {
+      const story = storyById.get(item.story_id), owner = profileById.get(item.owner_id); if (!story || !owner) continue;
+      if (!groups.has(item.owner_id + ':' + item.title)) groups.set(item.owner_id + ':' + item.title, { owner, title: item.title, items: [], isYours: item.owner_id === window.surfCurrentUserId });
+      if (story.media_path) {
+        const { data: signed, error: signedError } = await db.storage.from('surf-stories').createSignedUrl(story.media_path, 3600);
+        if (!signedError) story.url = signed.signedUrl;
+      }
+      groups.get(item.owner_id + ':' + item.title).items.push(story);
+    }
+    highlightSets = [...groups.values()]; list.replaceChildren();
+    highlightSets.forEach((entry) => {
+      const card = document.createElement('button'); card.type = 'button'; card.className = 'story-highlight-card';
+      const first = entry.items[0];
+      if (first?.url) { const img = document.createElement('img'); img.src = first.url; img.alt = ''; card.append(img); }
+      else if (first?.background_color) card.style.background = first.background_color;
+      const label = document.createElement('span'); label.textContent = entry.title; card.append(label);
+      card.onclick = () => openLiveStory({ ...entry, owner: entry.owner }); list.append(card);
+    });
   }
 
   async function shareLiveStory() {
@@ -744,7 +873,7 @@
         }
       }
       yourStories = [...uploaded, ...(yourStories || [])];
-      await loadStories(); closeModal('storyModal'); activeStoryCollection = yourStories; activeStoryOwner = 'Your story'; activeStoryEmoji = initials({ username: document.querySelector('.profile-name')?.textContent }); activeStoryIndex = 0;
+      await loadStories(); closeModal('storyModal'); activeStoryCollection = yourStories; activeStoryOwner = 'Your story'; activeStoryProfile = selfProfile; activeStoryEmoji = initials(selfProfile || {}); activeStoryIndex = 0; activeStoryViewId = null;
       renderStoryViewer(); openModal('storyViewer'); toast('Uploaded!', 1000);
     } catch (error) { safeError(error, 'Story upload failed. Check storage setup and try again.'); }
   }
@@ -752,7 +881,7 @@
   function renderAllLiveStories() {
     const grid = document.getElementById('allStoriesGrid'); if (!grid) return;
     grid.innerHTML = '';
-    const entries = [{ owner: { username: document.querySelector('.profile-handle')?.textContent.replace(/^@/, '') || 'you', display_name: 'Your story' }, items: yourStories, isYours: true }, ...storySets];
+    const entries = [{ owner: selfProfile || { username: document.querySelector('.profile-handle')?.textContent.replace(/^@/, '') || 'you', display_name: 'Your story' }, items: yourStories, isYours: true }, ...storySets];
     entries.forEach((entry) => {
       if (!entry.items.length && !entry.isYours) return;
       const card = document.createElement('button'); card.type = 'button'; card.className = 'stories-page-card' + (entry.isYours ? ' is-yours' : '');
@@ -1032,6 +1161,11 @@
   window.renderFriendsList = loadFriendsAndRequests;
   window.setFriendsTab = setFriendTab;
   window.renderStoryViewer = renderLiveStoryViewer;
+  window.stepStory = stepLiveStory;
+  window.handleYourStoryClick = () => { if (yourStories.length) openLiveStory({ owner: selfProfile, items: yourStories, isYours: true }); else { resetStoryComposer(); openModal('storyModal'); } };
+  window.openStoryViewers = openStoryViewers;
+  window.toggleStoryLike = toggleStoryLike;
+  window.addStoryHighlight = addStoryHighlight;
   window.renderAllStories = renderAllLiveStories;
   window.openAllStories = () => { renderAllLiveStories(); openModal('storiesPage'); };
   window.openFriendStory = (name) => { const entry = storySets.find((item) => item.owner.display_name === name || item.owner.username === name); if (entry) openLiveStory(entry); };
