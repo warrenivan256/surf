@@ -12,6 +12,8 @@
   let activeFriendTab = 'all';
   let activeChannel = null;
   let messageChannel = null;
+  let pendingProfileImage = null;
+  let pendingCropData = null;
 
   const initials = (person) => (person?.display_name || person?.username || '?')
     .trim().split(/\s+/).slice(0, 2).map((part) => part[0]?.toUpperCase() || '').join('');
@@ -66,6 +68,53 @@
 
   function findPerson(id) { return friends.find((person) => person.id === id) || storySets.find((entry) => entry.owner.id === id)?.owner || (activeProfile?.id === id ? activeProfile : null); }
 
+  function profileAssetUrl(path) {
+    if (!path) return '';
+    return db.storage.from('surf-profile-assets').getPublicUrl(path).data.publicUrl;
+  }
+
+  function applyProfileAssets(profile) {
+    const avatarUrl = profileAssetUrl(profile?.avatar_path);
+    const bannerUrl = profileAssetUrl(profile?.banner_path);
+    const cropFor = (kind) => {
+      try { return JSON.parse(localStorage.getItem(`surf-profile-crop:${profile?.id}:${kind}`) || 'null'); } catch { return null; }
+    };
+    const paint = (element, url, crop) => {
+      if (!element || !url) return;
+      element.style.backgroundImage = `url("${url}")`; element.style.backgroundRepeat = 'no-repeat';
+      if (crop?.width && crop?.height && crop?.sourceWidth && crop?.sourceHeight) {
+        const rect = element.getBoundingClientRect();
+        const scale = Math.max(rect.width / crop.width, rect.height / crop.height);
+        element.style.backgroundSize = `${Math.round(crop.sourceWidth * scale)}px ${Math.round(crop.sourceHeight * scale)}px`;
+        element.style.backgroundPosition = `-${Math.round(crop.x * scale)}px -${Math.round(crop.y * scale)}px`;
+      } else { element.style.backgroundSize = 'cover'; element.style.backgroundPosition = 'center'; }
+    };
+    if (avatarUrl) {
+      const avatar = document.querySelector('.profile-avatar');
+      if (avatar) {
+        [...avatar.childNodes].filter((node) => node.nodeType === Node.TEXT_NODE).forEach((node) => node.remove());
+        paint(avatar, avatarUrl, cropFor('avatar'));
+      }
+      const pageAvatar = document.getElementById('pageAvatar');
+      if (pageAvatar) { pageAvatar.textContent = ''; paint(pageAvatar, avatarUrl, cropFor('avatar')); }
+    }
+    if (bannerUrl) {
+      const cover = document.querySelector('.profile-cover');
+      paint(cover, bannerUrl, cropFor('banner'));
+      document.documentElement.style.setProperty('--profile-banner', `url("${bannerUrl}")`);
+      const crop = cropFor('banner');
+      if (crop?.width && crop?.height && crop?.sourceWidth && crop?.sourceHeight) {
+        const width = Math.min(980, Math.max(300, window.innerWidth - 32)), height = 170;
+        const scale = Math.max(width / crop.width, height / crop.height);
+        document.documentElement.style.setProperty('--banner-size', `${Math.round(crop.sourceWidth * scale)}px ${Math.round(crop.sourceHeight * scale)}px`);
+        document.documentElement.style.setProperty('--banner-position', `-${Math.round(crop.x * scale)}px -${Math.round(crop.y * scale)}px`);
+      } else {
+        document.documentElement.style.setProperty('--banner-size', 'cover');
+        document.documentElement.style.setProperty('--banner-position', 'center');
+      }
+    }
+  }
+
   async function loadLiveSurfWorkspace() {
     const userId = window.surfCurrentUserId;
     if (!userId) return;
@@ -79,7 +128,7 @@
       requests = relations || [];
       const ids = [...new Set(requests.flatMap((rel) => rel.status === 'accepted' ? [rel.requester_id, rel.addressee_id] : [rel.requester_id, rel.addressee_id]).filter((id) => id !== userId))];
       if (ids.length) {
-        const { data: profiles, error } = await db.from('profiles').select('id,username,display_name,bio,status,created_at').in('id', ids);
+        const { data: profiles, error } = await db.from('profiles').select('id,username,display_name,bio,status,created_at,avatar_path,banner_path').in('id', ids);
         if (error) throw error;
         const byId = new Map((profiles || []).map((profile) => [profile.id, profile]));
         friends = requests.map((rel) => ({ ...byId.get(rel.requester_id === userId ? rel.addressee_id : rel.requester_id), relation: rel }))
@@ -279,13 +328,19 @@
     if (raw.length < 2) return setEmpty(box, 'Type at least two characters to search real Surf users.');
     const term = raw.replace(/[^\p{L}\p{N} ._-]/gu, '').slice(0, 40);
     if (!term) return setEmpty(box, 'Enter a name or username to search.');
-    const { data, error } = await db.from('profiles').select('id,username,display_name,bio,status,created_at').neq('id', window.surfCurrentUserId)
-      .or(`username.ilike.%${term}%,display_name.ilike.%${term}%`).limit(20);
-    if (error) return safeError(error, 'Search is unavailable right now.');
+    const [byUsername, byName] = await Promise.all([
+      db.from('profiles').select('id,username,display_name,bio,status,created_at,avatar_path,banner_path').neq('id', window.surfCurrentUserId).ilike('username', `%${term}%`).limit(20),
+      db.from('profiles').select('id,username,display_name,bio,status,created_at,avatar_path,banner_path').neq('id', window.surfCurrentUserId).ilike('display_name', `%${term}%`).limit(20)
+    ]);
+    if (byUsername.error) return safeError(byUsername.error, 'Search is unavailable right now.');
+    if (byName.error) return safeError(byName.error, 'Search is unavailable right now.');
+    const data = [...new Map([...(byUsername.data || []), ...(byName.data || [])].map((person) => [person.id, person])).values()].slice(0, 20);
     box.innerHTML = '';
     (data || []).forEach((person) => {
       const row = document.createElement('div'); row.className = 'discover-result';
       const avatar = avatarNode(person, 'discover-result-avatar');
+      const avatarUrl = profileAssetUrl(person.avatar_path);
+      if (avatarUrl) { avatar.textContent = ''; avatar.style.backgroundImage = `url("${avatarUrl}")`; avatar.style.backgroundSize = 'cover'; avatar.style.backgroundPosition = 'center'; }
       const copy = document.createElement('span'); copy.className = 'discover-result-copy';
       const name = document.createElement('b'); name.textContent = person.display_name || person.username;
       const handle = document.createElement('small'); handle.textContent = '@' + person.username; copy.append(name, handle);
@@ -304,6 +359,13 @@
   async function openLiveProfile(person) {
     activeProfile = person;
     document.getElementById('discoverAvatar').textContent = initials(person);
+    const avatarUrl = profileAssetUrl(person.avatar_path);
+    const discoverAvatar = document.getElementById('discoverAvatar');
+    discoverAvatar.style.backgroundImage = avatarUrl ? `url("${avatarUrl}")` : '';
+    discoverAvatar.style.backgroundSize = 'cover'; discoverAvatar.style.backgroundPosition = 'center';
+    const discoverBanner = document.getElementById('discoverBanner');
+    discoverBanner.style.backgroundImage = person.banner_path ? `url("${profileAssetUrl(person.banner_path)}")` : '';
+    discoverBanner.style.backgroundSize = 'cover'; discoverBanner.style.backgroundPosition = 'center';
     document.getElementById('discoverName').textContent = person.display_name || person.username;
     document.getElementById('discoverHandle').textContent = '@' + person.username + ' · ' + statusLabel(person.status).toLowerCase();
     document.getElementById('discoverBio').textContent = person.bio || 'No bio yet.';
@@ -500,6 +562,13 @@
     document.getElementById('profileCardHandle').textContent = '@' + person.username + ' · ' + statusLabel(person.status).toLowerCase();
     document.getElementById('profileCardBio').textContent = person.bio || 'No bio yet.';
     document.getElementById('profileCardAvatar').textContent = initials(person);
+    const cardAvatarUrl = profileAssetUrl(person.avatar_path);
+    const cardAvatar = document.getElementById('profileCardAvatar');
+    cardAvatar.style.backgroundImage = cardAvatarUrl ? `url("${cardAvatarUrl}")` : '';
+    cardAvatar.style.backgroundSize = 'cover'; cardAvatar.style.backgroundPosition = 'center';
+    const cardBanner = document.getElementById('profileCardBanner');
+    cardBanner.style.backgroundImage = person.banner_path ? `url("${profileAssetUrl(person.banner_path)}")` : '';
+    cardBanner.style.backgroundSize = 'cover'; cardBanner.style.backgroundPosition = 'center';
     document.getElementById('profileCardPosts').textContent = '0'; document.getElementById('profileCardFollowers').textContent = '0'; document.getElementById('profileCardFollowing').textContent = '0';
     const rel = person.relation;
     document.getElementById('blockPersonButton').textContent = 'Block'; document.getElementById('mutePersonButton').textContent = 'Mute';
@@ -590,6 +659,48 @@
     toast('Friend request sent.');
   }
 
+  async function persistProfileImage(file, kind) {
+    if (!file || !window.surfCurrentUserId) return;
+    if (!file.type.startsWith('image/')) return toast('Choose an image file.');
+    if (file.size > 10 * 1024 * 1024) return toast('Images must be 10 MB or smaller.');
+    const extension = (file.name.split('.').pop() || 'jpg').toLowerCase().replace(/[^a-z0-9]/g, '') || 'jpg';
+    const path = `${window.surfCurrentUserId}/${kind}-${Date.now()}.${extension}`;
+    const { error: uploadError } = await db.storage.from('surf-profile-assets').upload(path, file, { contentType: file.type, upsert: false });
+    if (uploadError) return safeError(uploadError, 'Image upload failed. Check profile image storage setup.');
+    const column = kind === 'avatar' ? 'avatar_path' : 'banner_path';
+    const previous = selfProfile?.[column];
+    const { error: saveError } = await db.from('profiles').update({ [column]: path, updated_at: new Date().toISOString() }).eq('id', window.surfCurrentUserId);
+    if (saveError) {
+      await db.storage.from('surf-profile-assets').remove([path]);
+      return safeError(saveError, 'Image uploaded but could not be saved to your profile.');
+    }
+    selfProfile = { ...selfProfile, [column]: path };
+    const crop = pendingCropData;
+    if (crop) localStorage.setItem(`surf-profile-crop:${window.surfCurrentUserId}:${kind}`, JSON.stringify(crop));
+    applyProfileAssets(selfProfile);
+    if (previous && previous !== path) await db.storage.from('surf-profile-assets').remove([previous]);
+    toast(kind === 'avatar' ? 'Profile picture saved.' : 'Profile banner saved.');
+  }
+
+  function bindProfileImageUploads() {
+    document.getElementById('pfpInput')?.addEventListener('change', (event) => { pendingProfileImage = event.target.files?.[0] ? { file: event.target.files[0], kind: 'avatar' } : null; });
+    document.getElementById('bannerInput')?.addEventListener('change', (event) => { pendingProfileImage = event.target.files?.[0] ? { file: event.target.files[0], kind: 'banner' } : null; });
+    const crop = window.saveCrop;
+    window.saveCrop = async function() {
+      const pending = pendingProfileImage; pendingProfileImage = null;
+      let task = null;
+      try { if (typeof cropTask !== 'undefined') task = cropTask; } catch { /* Crop state is not available. */ }
+      crop();
+      if (task?.source && task?.bounds) pendingCropData = { ...task.source, sourceWidth: task.naturalWidth, sourceHeight: task.naturalHeight };
+      if (pending) {
+        try { await persistProfileImage(pending.file, pending.kind); }
+        finally { pendingCropData = null; }
+      }
+    };
+    const cancel = window.cancelCrop;
+    window.cancelCrop = function() { pendingProfileImage = null; cancel(); };
+  }
+
   function enterAppWithLiveData() {
     const original = window.enterApp;
     window.enterApp = function(user) {
@@ -598,6 +709,7 @@
         selfProfile = user;
         window.surfCurrentUserId = user.id;
         removeSeedContent();
+        applyProfileAssets(user);
         document.getElementById('pageName').textContent = user.username || 'Your profile';
         document.getElementById('pageHandle').textContent = user.handle || '';
         document.getElementById('pageBio').textContent = user.bio || '';
@@ -605,7 +717,6 @@
       }
       else { window.surfCurrentUserId = null; window.surfActiveRecipientId = null; window.surfActiveGroupId = null; }
     };
-    const originalShowMyProfile = window.showMyProfile;
     window.showMyProfile = function() {
       if (!selfProfile) return;
       document.documentElement.style.removeProperty('--profile-banner');
@@ -618,6 +729,7 @@
       document.querySelectorAll('#profileGrid .grid-post').forEach((item) => item.remove());
       document.querySelectorAll('#profilePage .profile-stats b').forEach((item) => { item.textContent = '0'; });
       document.getElementById('profilePage').style.display = 'block';
+      applyProfileAssets(selfProfile);
     };
   }
 
@@ -672,5 +784,6 @@
   document.querySelector('.chat-top .top-actions')?.setAttribute('style', 'display:none');
   document.getElementById('composer')?.querySelectorAll('input,button').forEach((item) => { item.disabled = true; });
   bindSearches();
+  bindProfileImageUploads();
   if (window.surfCurrentUserId) loadLiveSurfWorkspace();
 })();
