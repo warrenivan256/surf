@@ -159,9 +159,10 @@
     if (!['online','dnd','offline'].includes(status)) return;
     const userId = window.surfCurrentUserId;
     if (!userId) return toast('Please sign in to change your status.');
-    const { error } = await db.from('profiles').update({ status, updated_at: new Date().toISOString() }).eq('id', userId);
+    const { data: updatedProfile, error } = await db.from('profiles').update({ status, updated_at: new Date().toISOString() }).eq('id', userId).select('id,status,updated_at').maybeSingle();
     if (error) return safeError(error, 'Could not update your status. Check profile update permissions.');
-    selfProfile = { ...(selfProfile || {}), status };
+    if (!updatedProfile) return toast('Status was not saved. Check your profile update policy.');
+    selfProfile = { ...(selfProfile || {}), ...updatedProfile, status };
     document.querySelectorAll('[data-presence]').forEach(button => button.classList.toggle('selected', button.dataset.presence === status));
     const labels = { online: 'Online', dnd: 'Do not disturb', offline: 'Offline' };
     const label = document.getElementById('myPresenceText'); if (label) label.textContent = labels[status];
@@ -269,7 +270,11 @@
       const copy = document.createElement('div'); copy.className = 'person-info';
       const name = document.createElement('div'); name.className = 'person-name'; name.textContent = group.name;
       const preview = document.createElement('div'); preview.className = 'preview'; preview.textContent = 'Group conversation';
-      copy.append(name, preview); row.append(icon, copy); row.onclick = () => selectLiveGroup(row, group); row.ondblclick = (event) => { event.preventDefault(); openGroupDetails(group); }; row.title = 'Double-click to view group details'; list.append(row);
+      copy.append(name, preview); row.append(icon, copy); row.onclick = () => selectLiveGroup(row, group); row.ondblclick = (event) => { event.preventDefault(); openGroupDetails(group); }; row.title = 'Open group chat';
+      const details = document.createElement('button'); details.type = 'button'; details.className = 'group-row-details'; details.textContent = '•••'; details.title = 'Group settings and members'; details.setAttribute('aria-label', 'Open ' + group.name + ' settings');
+      details.style.cssText = 'margin-left:auto;align-self:center;background:transparent;color:inherit;border-radius:9px;padding:7px 9px;opacity:.85;flex-shrink:0';
+      details.onclick = (event) => { event.preventDefault(); event.stopPropagation(); openGroupDetails(group); };
+      row.append(details); list.append(row);
     });
     if (!people.length && !groups.length) setEmpty(list, 'No conversations yet. Use Discover to find people and send a friend request.');
   }
@@ -438,6 +443,24 @@
         if (payload.new.group_id === window.surfActiveGroupId && payload.new.sender_id !== window.surfCurrentUserId) displayMessage(payload.new, { username: 'Member' });
       }).on('postgres_changes', { event: '*', schema: 'public', table: 'friend_requests', filter: 'addressee_id=eq.' + window.surfCurrentUserId }, () => { scheduleNotificationRefresh(); scheduleRelationshipRefresh(); })
         .on('postgres_changes', { event: '*', schema: 'public', table: 'friend_requests', filter: 'requester_id=eq.' + window.surfCurrentUserId }, () => { scheduleNotificationRefresh(); scheduleRelationshipRefresh(); })
+        .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'profiles' }, (payload) => {
+          const changed = payload.new;
+          if (!changed?.id) return;
+          if (changed.id === window.surfCurrentUserId) selfProfile = { ...(selfProfile || {}), ...changed };
+          const friend = friends.find(person => person.id === changed.id);
+          if (friend) Object.assign(friend, { status: changed.status, display_name: changed.display_name, username: changed.username, avatar_path: changed.avatar_path });
+          if (friend) {
+            renderChatList();
+            loadFriendsAndRequests();
+            if (window.surfActiveRecipientId === changed.id) updateChatPresence(friend);
+          }
+          if (changed.id === window.surfCurrentUserId) {
+            const status = changed.status || 'offline';
+            document.querySelectorAll('[data-presence]').forEach(button => button.classList.toggle('selected', button.dataset.presence === status));
+            const labels = { online: 'Online', dnd: 'Do not disturb', offline: 'Offline' };
+            const label = document.getElementById('myPresenceText'); if (label) label.textContent = labels[status] || 'Offline';
+          }
+        })
         .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'direct_messages', filter: `sender_id=eq.${window.surfCurrentUserId}` }, (payload) => {
           if (payload.new.recipient_id !== window.surfActiveRecipientId) return;
           const person = findPerson(payload.new.recipient_id); if (person) loadDirectMessages(person);
@@ -1097,6 +1120,7 @@
     let modal = document.getElementById('postDetailModal');
     if (!modal) {
       modal = document.createElement('div'); modal.id='postDetailModal'; modal.className='modal-back';
+      modal.style.zIndex = '10020';
       modal.innerHTML='<section class="modal post-detail-modal"><button class="close" type="button" data-close>×</button><div class="post-detail-layout"><div class="post-detail-media"></div><aside><h2>Post</h2><p class="post-detail-caption"></p><div class="post-detail-actions"><button type="button" data-like>♡ Like <span>0</span></button><button type="button" data-focus-comment>Comment</button><button type="button" data-save>Save</button></div><div class="post-comments"></div><form class="post-comment-form"><input maxlength="1000" placeholder="Write a comment…" required><button class="btn primary">Send</button></form></aside></div></section>';
       document.body.append(modal); modal.addEventListener('click',e=>{if(e.target===modal||e.target.closest('[data-close]'))modal.style.display='none';});
     }
@@ -1119,7 +1143,7 @@
     modal.querySelector('[data-focus-comment]').onclick=()=>form.querySelector('input').focus();
     modal.querySelector('[data-save]').onclick=async()=>{const r=await db.from('saved_posts').select('post_id').eq('post_id',post.id).eq('user_id',window.surfCurrentUserId).maybeSingle();if(r.error)return safeError(r.error,'Could not check saved post.');const x=r.data?await db.from('saved_posts').delete().eq('post_id',post.id).eq('user_id',window.surfCurrentUserId):await db.from('saved_posts').insert({post_id:post.id,user_id:window.surfCurrentUserId});if(x.error)return safeError(x.error,'Could not save post.');toast(r.data?'Post unsaved':'Post saved');};
     form.onsubmit=async e=>{e.preventDefault();const input=form.querySelector('input'),body=input.value.trim();if(!body)return;const r=await db.from('post_comments').insert({post_id:post.id,user_id:window.surfCurrentUserId,body});if(r.error)return safeError(r.error,'Could not post comment. Apply post-interactions SQL migration.');input.value='';await refreshPostSocial();};
-    await refreshPostSocial(); modal.style.display='grid';
+    await refreshPostSocial(); modal.style.zIndex='10020'; modal.style.display='grid';
   }
   async function openFollowList(kind, ownerId = window.surfCurrentUserId) {
     const column=kind==='followers'?'follower_id':'followed_id';
@@ -1370,8 +1394,12 @@
   async function openLiveCreateGroup() { syncGroupPicker(); openModal('createGroupModal'); }
 
   async function openGroupDetails(group = window.surfActiveGroup) {
-    if (!group?.id) return;
+    if (!group?.id) return toast('Choose a group first.');
     window.surfActiveGroup = group;
+    const detailsModal = document.getElementById('groupDetailsModal');
+    if (detailsModal) { detailsModal.style.zIndex = '10010'; detailsModal.style.display = 'grid'; }
+    const memberListLoading = document.getElementById('groupDetailsMembers');
+    if (memberListLoading) memberListLoading.innerHTML = '<p class="friends-empty">Loading group members…</p>';
     const { data: selfMembership } = await db.from('group_members').select('role').eq('group_id', group.id).eq('user_id', window.surfCurrentUserId).maybeSingle();
     group.my_role = selfMembership?.role || (group.owner_id === window.surfCurrentUserId ? 'owner' : 'member');
     const isAdmin = group.my_role === 'admin' || group.my_role === 'owner' || group.owner_id === window.surfCurrentUserId;
@@ -1410,6 +1438,7 @@
       }
       list.append(row);
     });
+    if (detailsModal) detailsModal.style.zIndex = '10010';
     openModal('groupDetailsModal');
   }
 
