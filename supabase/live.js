@@ -237,12 +237,57 @@
     return data || [];
   }
 
+  function chatReadKey(kind, id) {
+    return `surfChatLastRead:${window.surfCurrentUserId}:${kind}:${id}`;
+  }
+  function getChatLastRead(kind, id) {
+    const value = Number(localStorage.getItem(chatReadKey(kind, id)) || 0);
+    return Number.isFinite(value) ? value : 0;
+  }
+  function markChatReadLocally(kind, id, timestamp = Date.now()) {
+    if (!id || !window.surfCurrentUserId) return;
+    localStorage.setItem(chatReadKey(kind, id), String(timestamp));
+  }
+  function addUnreadBadge(row, count) {
+    if (!count) return;
+    const badge = document.createElement('span');
+    badge.className = 'chat-unread-badge';
+    badge.textContent = count > 99 ? '99+' : String(count);
+    badge.setAttribute('aria-label', `${count} unread message${count === 1 ? '' : 's'}`);
+    row.append(badge);
+  }
+
   async function renderChatList() {
     const list = document.getElementById('chatList');
     if (!list) return;
     list.innerHTML = '';
     let messages = [];
     try { messages = await latestMessages(); } catch (error) { safeError(error, 'Could not load conversations.'); }
+    const unreadDirect = new Map();
+    const unreadGroups = new Map();
+    try {
+      const { data: received, error: receivedError } = await db.from('direct_messages')
+        .select('sender_id,created_at').eq('recipient_id', window.surfCurrentUserId)
+        .order('created_at', { ascending: false }).limit(1000);
+      if (receivedError) throw receivedError;
+      for (const message of (received || [])) {
+        const lastRead = getChatLastRead('direct', message.sender_id);
+        if (Date.parse(message.created_at || 0) > lastRead) unreadDirect.set(message.sender_id, (unreadDirect.get(message.sender_id) || 0) + 1);
+      }
+    } catch (error) { console.warn('Could not load unread direct-message counts:', error); }
+    if (groups.length) {
+      try {
+        const { data: groupRows, error: groupUnreadError } = await db.from('group_messages')
+          .select('group_id,sender_id,created_at').in('group_id', groups.map(group => group.id))
+          .order('created_at', { ascending: false }).limit(2000);
+        if (groupUnreadError) throw groupUnreadError;
+        for (const message of (groupRows || [])) {
+          if (message.sender_id === window.surfCurrentUserId) continue;
+          const lastRead = getChatLastRead('group', message.group_id);
+          if (Date.parse(message.created_at || 0) > lastRead) unreadGroups.set(message.group_id, (unreadGroups.get(message.group_id) || 0) + 1);
+        }
+      } catch (error) { console.warn('Could not load unread group-message counts:', error); }
+    }
     const friendIds = new Set(requests.filter((item) => item.status === 'accepted').map((item) => item.requester_id === window.surfCurrentUserId ? item.addressee_id : item.requester_id));
     const people = friends.filter((person) => friendIds.has(person.id));
     const newestByPerson = new Map();
@@ -264,6 +309,7 @@
       const time = document.createElement('div'); time.className = `presence-dot ${person.status || 'offline'}`; time.title = statusLabel(person.status); time.setAttribute('aria-label', statusLabel(person.status));
       copy.append(name, preview);
       row.append(avatarNode(person), copy, time);
+      addUnreadBadge(row, unreadDirect.get(person.id) || 0);
       row.onclick = () => selectLivePerson(row, person);
       list.append(row);
     });
@@ -278,6 +324,7 @@
       const details = document.createElement('button'); details.type = 'button'; details.className = 'group-row-details'; details.textContent = '•••'; details.title = 'Group settings and members'; details.setAttribute('aria-label', 'Open ' + group.name + ' settings');
       details.style.cssText = 'margin-left:auto;align-self:center;background:transparent;color:inherit;border-radius:9px;padding:7px 9px;opacity:.85;flex-shrink:0';
       details.onclick = (event) => { event.preventDefault(); event.stopPropagation(); openGroupDetails(group); };
+      addUnreadBadge(row, unreadGroups.get(group.id) || 0);
       row.append(details); list.append(row);
     });
     if (!people.length && !groups.length) setEmpty(list, 'No conversations yet. Use Discover to find people and send a friend request.');
@@ -359,7 +406,9 @@
     document.getElementById('composer')?.querySelectorAll('input,button').forEach((item) => { item.disabled = false; });
     document.getElementById('blockedNotice').style.display = 'none';
     app.classList.add('show-chat');
+    markChatReadLocally('direct', person.id);
     await loadDirectMessages(person);
+    renderChatList();
   }
 
   async function selectLiveGroup(row, group) {
@@ -379,6 +428,7 @@
     const badge = document.getElementById('chatOnlineBadge'); if (badge) badge.style.display = 'none';
     document.getElementById('composer')?.querySelectorAll('input,button').forEach((item) => { item.disabled = false; });
     app.classList.add('show-chat'); clearMessages('Loading group messages…');
+    markChatReadLocally('group', group.id);
     const [{ data: memberships, error: memberError }, { data: data, error }] = await Promise.all([
       db.from('group_members').select('user_id,role').eq('group_id', group.id),
       db.from('group_messages').select('id,sender_id,body,created_at').eq('group_id', group.id).order('created_at', { ascending: true })
@@ -394,12 +444,13 @@
     const byId = new Map(memberProfiles.map(p => [p.id,p]));
     if (statusNode) statusNode.textContent = `${memberIds.length || 1} member${(memberIds.length || 1) === 1 ? '' : 's'}`;
     const list = document.getElementById('messages'); list.innerHTML = '';
-    if (!data?.length) { clearMessages('No messages yet. Say hello!'); return; }
+    if (!data?.length) { clearMessages('No messages yet. Say hello!'); renderChatList(); return; }
     data.forEach((message) => {
       const profile = byId.get(message.sender_id);
       displayMessage(message, message.sender_id === window.surfCurrentUserId ? null : { username: profile?.display_name || profile?.username || 'Member', display_name: profile?.display_name, avatar_path: profile?.avatar_path, id: profile?.id });
     });
     list.scrollTop = list.scrollHeight;
+    renderChatList();
   }
 
   async function sendLiveMessage(text) {
@@ -463,10 +514,14 @@
         const isOpen = payload.new.sender_id === window.surfActiveRecipientId;
         await markMessagesDelivered([payload.new], isOpen);
         const now = new Date().toISOString();
-        if (isOpen) displayMessage({ ...payload.new, delivered_at: now, read_at: isOpen && localReadReceiptsEnabled() ? now : null }, person);
+        if (isOpen) {
+          markChatReadLocally('direct', payload.new.sender_id);
+          displayMessage({ ...payload.new, delivered_at: now, read_at: isOpen && localReadReceiptsEnabled() ? now : null }, person);
+        }
         renderChatList();
         scheduleNotificationRefresh();
       }).on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'group_messages' }, async (payload) => {
+        if (payload.new.group_id === window.surfActiveGroupId && payload.new.sender_id !== window.surfCurrentUserId) markChatReadLocally('group', payload.new.group_id);
         renderChatList();
         if (payload.new.group_id === window.surfActiveGroupId && payload.new.sender_id !== window.surfCurrentUserId) {
           const { data: sender } = await db.from('profiles').select('id,username,display_name,avatar_path').eq('id', payload.new.sender_id).maybeSingle();
