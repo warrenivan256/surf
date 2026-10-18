@@ -11,6 +11,7 @@
   let activeProfile = null;
   let activeStoryProfile = null;
   let activeStoryViewId = null;
+  let storyAdvanceTimer = null;
   const likedStoryIds = new Set();
   let selfProfile = null;
   let activeFriendTab = 'all';
@@ -346,7 +347,7 @@
           const accept = document.createElement('button'); accept.className = 'friend-request-action accept'; accept.title = 'Accept request'; accept.textContent = '✓'; accept.onclick = () => answerRequest(person.relation, true);
           const reject = document.createElement('button'); reject.className = 'friend-request-action reject'; reject.title = 'Decline request'; reject.textContent = '×'; reject.onclick = () => answerRequest(person.relation, false); row.append(accept, reject);
         } else if (person.relation.status === 'accepted') {
-          const chat = document.createElement('button'); chat.className = 'friend-request-action accept'; chat.title = 'Message'; chat.textContent = '…'; chat.onclick = () => { closeModal('friendsModal'); const chatRow = document.querySelector(`#chatList [data-user-id="${person.id}"]`); if (chatRow) selectLivePerson(chatRow, person); }; row.append(chat);
+          const chat = document.createElement('button'); chat.className = 'friend-request-action accept'; chat.title = 'Message'; chat.setAttribute('aria-label', 'Message ' + (person.display_name || person.username)); chat.textContent = '✉'; chat.onclick = () => { closeModal('friendsModal'); const chatRow = document.querySelector(`#chatList [data-user-id="${person.id}"]`); if (chatRow) selectLivePerson(chatRow, person); }; row.append(chat);
         }
         section.append(row);
       });
@@ -722,6 +723,7 @@
 
   function renderLiveStoryViewer() {
     const story = activeStoryCollection?.[activeStoryIndex]; if (!story) return;
+    clearTimeout(storyAdvanceTimer);
     const image = document.getElementById('storyViewerImage'), text = document.getElementById('storyViewerText');
     image.style.display = story.kind === 'image' ? 'block' : 'none'; text.style.display = story.kind === 'text' ? 'grid' : 'none';
     if (story.kind === 'image') { image.src = story.url; text.textContent = ''; }
@@ -731,7 +733,15 @@
     storyAvatar.textContent = storyAvatarUrl ? '' : activeStoryEmoji;
     storyAvatar.style.backgroundImage = storyAvatarUrl ? `url("${storyAvatarUrl}")` : '';
     document.getElementById('storyViewerCount').textContent = `${activeStoryIndex + 1} / ${activeStoryCollection.length}`;
-    document.getElementById('storyProgress').style.setProperty('--story-progress', `${((activeStoryIndex + 1) / activeStoryCollection.length) * 100}%`);
+    const progress = document.getElementById('storyProgress');
+    progress.style.setProperty('--story-progress', '0%');
+    progress.classList.remove('is-advancing');
+    void progress.offsetWidth;
+    requestAnimationFrame(() => progress.classList.add('is-advancing'));
+    storyAdvanceTimer = setTimeout(() => {
+      if (activeStoryIndex < activeStoryCollection.length - 1) stepLiveStory(1);
+      else closeModal('storyViewer');
+    }, 3000);
     document.querySelector('.story-prev').style.display = activeStoryIndex > 0 ? 'grid' : 'none';
     document.querySelector('.story-next').style.display = activeStoryIndex < activeStoryCollection.length - 1 ? 'grid' : 'none';
     const isOwnStory = activeStoryProfile?.id === window.surfCurrentUserId;
