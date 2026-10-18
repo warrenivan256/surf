@@ -136,7 +136,7 @@
     try {
       const [{ data: relations, error: relationError }, { data: groupRows, error: groupError }] = await Promise.all([
         db.from('friend_requests').select('id,requester_id,addressee_id,status,created_at,updated_at').or(`requester_id.eq.${userId},addressee_id.eq.${userId}`),
-        db.from('group_conversations').select('id,name,owner_id,created_at').order('created_at', { ascending: false })
+        db.from('group_conversations').select('id,name,bio,avatar_path,owner_id,created_at').order('created_at', { ascending: false })
       ]);
       if (relationError) throw relationError;
       if (groupError) throw groupError;
@@ -208,7 +208,7 @@
       copy.className = 'person-info';
       const name = document.createElement('div'); name.className = 'person-name'; name.textContent = person.display_name || person.username;
       const preview = document.createElement('div'); preview.className = 'preview'; preview.textContent = latest?.body || 'Start a conversation';
-      const time = document.createElement('div'); time.className = 'time'; time.textContent = statusLabel(person.status);
+      const time = document.createElement('div'); time.className = `presence-dot ${person.status || 'offline'}`; time.title = statusLabel(person.status); time.setAttribute('aria-label', statusLabel(person.status));
       copy.append(name, preview);
       row.append(avatarNode(person), copy, time);
       row.onclick = () => selectLivePerson(row, person);
@@ -216,7 +216,8 @@
     });
     groups.forEach((group) => {
       const row = document.createElement('div'); row.className = 'person'; row.dataset.groupId = group.id;
-      const icon = document.createElement('span'); icon.className = 'avatar'; icon.textContent = 'G';
+      const icon = document.createElement('span'); icon.className = 'avatar'; icon.textContent = group.avatar_path ? '' : 'G';
+      if (group.avatar_path) { icon.style.backgroundImage = `url("${db.storage.from('surf-group-assets').getPublicUrl(group.avatar_path).data.publicUrl}")`; icon.style.backgroundSize = 'cover'; icon.style.backgroundPosition = 'center'; }
       const copy = document.createElement('div'); copy.className = 'person-info';
       const name = document.createElement('div'); name.className = 'person-name'; name.textContent = group.name;
       const preview = document.createElement('div'); preview.className = 'preview'; preview.textContent = 'Group conversation';
@@ -304,6 +305,7 @@
   async function selectLiveGroup(row, group) {
     document.querySelectorAll('#chatList .person').forEach((item) => item.classList.remove('selected'));
     row.classList.add('selected'); window.surfActiveRecipientId = null; window.surfActiveGroupId = group.id;
+    window.surfActiveGroup = group;
     document.getElementById('chatName').textContent = group.name;
     document.getElementById('chatAvatar').textContent = 'G'; document.getElementById('chatAvatar').style.backgroundImage = ''; document.getElementById('chatAvatar').style.display = 'grid';
     document.getElementById('chatStatus').textContent = 'Group conversation';
@@ -328,8 +330,26 @@
     } else { toast('Choose a conversation first.'); return false; }
     if (result.error) { safeError(result.error, 'Message could not be sent.'); return false; }
     displayMessage(result.data, findPerson(result.data.recipient_id === sender ? result.data.sender_id : result.data.recipient_id));
+    playMessageSendTone();
     renderChatList();
     return true;
+  }
+
+  function playMessageSendTone() {
+    try {
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextClass) return;
+      window.surfMessageAudioContext ||= new AudioContextClass();
+      const ctx = window.surfMessageAudioContext;
+      if (ctx.state === 'suspended') ctx.resume();
+      const now = ctx.currentTime;
+      [[660, 0], [880, 0.075]].forEach(([frequency, offset]) => {
+        const oscillator = ctx.createOscillator(); const gain = ctx.createGain();
+        oscillator.type = 'sine'; oscillator.frequency.setValueAtTime(frequency, now + offset);
+        gain.gain.setValueAtTime(0.0001, now + offset); gain.gain.exponentialRampToValueAtTime(0.035, now + offset + 0.012); gain.gain.exponentialRampToValueAtTime(0.0001, now + offset + 0.12);
+        oscillator.connect(gain); gain.connect(ctx.destination); oscillator.start(now + offset); oscillator.stop(now + offset + 0.13);
+      });
+    } catch {}
   }
 
   function subscribeMessages() {
@@ -653,7 +673,7 @@
     const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
     const [requestResult, likeResult, postResult] = await Promise.all([
       db.from('friend_requests').select('id,requester_id,addressee_id,status,created_at,updated_at').eq('addressee_id', userId).eq('status', 'pending').gte('created_at', since).order('created_at', { ascending: false }).limit(40),
-      db.from('story_likes').select('id,story_id,user_id,created_at').gte('created_at', since).order('created_at', { ascending: false }).limit(60),
+      db.from('story_likes').select('story_id,user_id,created_at').gte('created_at', since).order('created_at', { ascending: false }).limit(60),
       db.from('posts').select('id,owner_id,created_at').gte('created_at', since).order('created_at', { ascending: false }).limit(80)
     ]);
     const failed = [requestResult, likeResult, postResult].find((result) => result.error);
@@ -878,9 +898,20 @@
   }
 
   async function addStoryToHighlight(story) {
-    const title = (prompt('Name this highlight:', 'Highlights') || '').trim(); if (!title) return;
+    window.pendingHighlightStory = story;
+    const input = document.getElementById('highlightNameInput');
+    if (input) input.value = '';
+    openModal('highlightNameModal');
+  }
+
+  async function saveStoryHighlight() {
+    const story = window.pendingHighlightStory;
+    const title = (document.getElementById('highlightNameInput')?.value || '').trim();
+    if (!story || !title) return toast('Enter a name for this highlight.');
     const { error } = await db.from('story_highlights').insert({ owner_id: window.surfCurrentUserId, story_id: story.id, title });
     if (error) return safeError(error, 'Could not add this story to highlights.');
+    window.pendingHighlightStory = null;
+    closeModal('highlightNameModal');
     try { await loadStoryHighlights(); } catch (loadError) { console.warn(loadError); }
     toast('Added to highlights.');
   }
@@ -946,21 +977,29 @@
     closeModal('postComposerModal'); await loadProfilePosts(window.surfCurrentUserId); await updateOwnCounts(); toast('Post shared.');
   }
 
-  async function loadProfilePosts(ownerId, target = document.getElementById('profileGrid')) {
+  async function loadProfilePosts(ownerId, target = document.getElementById('profileGrid'), view = 'posts') {
     if (!ownerId || !target) return;
     const { data: posts, error } = await db.from('posts').select('*').eq('owner_id', ownerId).order('created_at', { ascending: false });
     if (error) return safeError(error, 'Could not load posts.');
+    let visiblePosts = posts || [];
+    if (view === 'videos') visiblePosts = visiblePosts.filter((post) => post.media_type === 'video');
+    if (view === 'tagged') {
+      const { data: tags, error: tagError } = await db.from('post_tags').select('post_id').eq('tagged_user_id', ownerId);
+      if (tagError) return safeError(tagError, 'Could not load tagged posts.');
+      const taggedIds = new Set((tags || []).map((tag) => tag.post_id));
+      visiblePosts = visiblePosts.filter((post) => taggedIds.has(post.id));
+    }
     target.replaceChildren();
-    for (const post of posts || []) {
+    for (const post of visiblePosts) {
       const { data: signed } = await db.storage.from('surf-post-media').createSignedUrl(post.media_path, 3600);
       const card = document.createElement('article'); card.className = 'grid-post surf-post-card';
       if (signed?.signedUrl && post.media_type === 'video') { const video = document.createElement('video'); video.src = signed.signedUrl; video.controls = true; card.append(video); }
       else if (signed?.signedUrl) { const image = document.createElement('img'); image.src = signed.signedUrl; image.alt = post.caption || 'Surf post'; card.append(image); }
       const caption = document.createElement('p'); caption.textContent = post.caption; card.append(caption);
-      const save = document.createElement('button'); save.type = 'button'; save.className = 'save-post-button'; save.textContent = '♡ Save'; save.onclick = () => toggleSavedPost(post.id, save); card.append(save); target.append(card);
+      const save = document.createElement('button'); save.type = 'button'; save.className = 'save-post-button'; save.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4.5h12v16l-6-4-6 4z"/></svg><span>Save</span>'; save.setAttribute('aria-label', 'Save post'); save.onclick = () => toggleSavedPost(post.id, save); card.append(save); target.append(card);
     }
-    if (!(posts || []).length) setEmpty(target, 'No posts yet.');
-    const count = document.querySelector('.stats span:first-child b'); if (ownerId === window.surfCurrentUserId && count) count.textContent = String(posts?.length || 0);
+    if (!visiblePosts.length) setEmpty(target, view === 'videos' ? 'No videos yet.' : view === 'tagged' ? 'No tagged posts yet.' : 'No posts yet.');
+    if (ownerId === window.surfCurrentUserId) updateOwnCounts();
   }
 
   async function toggleSavedPost(postId, button) {
@@ -969,7 +1008,8 @@
     if (error) return safeError(error, 'Could not check saved posts.');
     const result = data ? await db.from('saved_posts').delete().eq('user_id', userId).eq('post_id', postId) : await db.from('saved_posts').insert({ user_id: userId, post_id: postId });
     if (result.error) return safeError(result.error, 'Could not update saved posts.');
-    button.textContent = data ? '♡ Save' : '♥ Saved';
+    button.classList.toggle('saved', !data);
+    button.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4.5h12v16l-6-4-6 4z"/></svg><span>${data ? 'Save' : 'Saved'}</span>`;
   }
 
   async function openSavedPosts() {
@@ -1135,7 +1175,20 @@
     if (values[0]) values[0].textContent = String(count || 0);
     if (values[1]) values[1].textContent = String(accepted);
     if (values[2]) values[2].textContent = String(accepted);
+    const profileValues = document.querySelectorAll('#profilePage .profile-stats b');
+    if (profileValues[0]) profileValues[0].textContent = String(count || 0);
+    if (profileValues[1]) profileValues[1].textContent = String(accepted);
+    if (profileValues[2]) profileValues[2].textContent = String(accepted);
   }
+
+  let currentProfileOwnerId = null;
+  window.switchProfileTab = function(tab, button) {
+    document.querySelectorAll('.profile-tab').forEach((item) => item.classList.toggle('active', item === button));
+    const grid = document.getElementById('profileGrid');
+    const view = tab === 'reels' ? 'videos' : tab;
+    if (grid) grid.dataset.view = view;
+    if (currentProfileOwnerId) loadProfilePosts(currentProfileOwnerId, grid, view);
+  };
 
   async function saveLiveProfile() {
     const displayName = document.getElementById('editUsername').value.trim();
@@ -1196,6 +1249,104 @@
   }
 
   async function openLiveCreateGroup() { syncGroupPicker(); openModal('createGroupModal'); }
+
+  async function openGroupDetails(group = window.surfActiveGroup) {
+    if (!group?.id) return;
+    window.surfActiveGroup = group;
+    const { data: selfMembership } = await db.from('group_members').select('role').eq('group_id', group.id).eq('user_id', window.surfCurrentUserId).maybeSingle();
+    group.my_role = selfMembership?.role || (group.owner_id === window.surfCurrentUserId ? 'owner' : 'member');
+    const isAdmin = group.my_role === 'admin' || group.my_role === 'owner' || group.owner_id === window.surfCurrentUserId;
+    document.getElementById('groupDetailsName').textContent = group.name;
+    document.getElementById('groupDetailsCreated').textContent = new Date(group.created_at).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' });
+    document.getElementById('groupDetailsBio').textContent = group.bio || 'No group bio yet.';
+    const avatar = document.getElementById('groupDetailsAvatar');
+    avatar.textContent = group.avatar_path ? '' : group.name.slice(0, 1).toUpperCase();
+    avatar.style.backgroundImage = group.avatar_path ? `url("${db.storage.from('surf-group-assets').getPublicUrl(group.avatar_path).data.publicUrl}")` : '';
+    document.getElementById('groupAdminTools').style.display = isAdmin ? 'block' : 'none';
+    document.getElementById('groupDetailsEditName').value = group.name;
+    document.getElementById('groupDetailsEditBio').value = group.bio || '';
+    document.getElementById('groupDeleteButton').style.display = isAdmin ? '' : 'none';
+    document.getElementById('groupLeaveButton').style.display = group.owner_id === window.surfCurrentUserId ? 'none' : '';
+    const list = document.getElementById('groupDetailsMembers'); list.replaceChildren();
+    const { data: memberships, error: membershipError } = await db.from('group_members').select('user_id,role,added_at').eq('group_id', group.id);
+    if (membershipError) return safeError(membershipError, 'Could not load group members.');
+    const memberIds = [...new Set((memberships || []).map((m) => m.user_id))];
+    let profiles = [];
+    if (memberIds.length) {
+      const { data, error } = await db.from('profiles').select('id,username,display_name,avatar_path').in('id', memberIds);
+      if (error) return safeError(error, 'Could not load member profiles.');
+      profiles = data || [];
+    }
+    document.getElementById('groupDetailsMemberCount').textContent = `${profiles.length} member${profiles.length === 1 ? '' : 's'}`;
+    memberships?.forEach((membership) => {
+      const person = profiles.find((p) => p.id === membership.user_id) || { id: membership.user_id, username: 'Member' };
+      const row = document.createElement('div'); row.className = 'group-details-member';
+      row.append(avatarNode(person, 'friend-list-avatar'));
+      const label = document.createElement('span'); label.textContent = person.display_name || person.username; row.append(label);
+      const role = document.createElement('small'); role.textContent = membership.role === 'owner' ? 'Owner' : membership.role === 'admin' ? 'Admin' : 'Member'; row.append(role);
+      if (isAdmin && membership.user_id !== window.surfCurrentUserId && membership.role !== 'owner') {
+        const admin = document.createElement('button'); admin.type = 'button'; admin.textContent = membership.role === 'admin' ? 'Remove admin' : 'Make admin';
+        admin.onclick = () => updateGroupMemberRole(group, membership.user_id, membership.role === 'admin' ? 'member' : 'admin'); row.append(admin);
+        const kick = document.createElement('button'); kick.type = 'button'; kick.className = 'danger-option'; kick.textContent = 'Remove'; kick.onclick = () => removeGroupMember(group, membership.user_id); row.append(kick);
+      }
+      list.append(row);
+    });
+    openModal('groupDetailsModal');
+  }
+
+  async function saveGroupDetails() {
+    const group = window.surfActiveGroup; if (!group) return;
+    const name = document.getElementById('groupDetailsEditName').value.trim().slice(0, 80);
+    const bio = document.getElementById('groupDetailsEditBio').value.trim().slice(0, 300);
+    if (!name) return toast('Group name cannot be empty.');
+    const { error } = await db.from('group_conversations').update({ name, bio }).eq('id', group.id);
+    if (error) return safeError(error, 'Could not update group details. Apply the group management migration, then try again.');
+    Object.assign(group, { name, bio });
+    document.getElementById('workspaceName').textContent = name;
+    document.getElementById('chatName').textContent = name;
+    document.getElementById('groupDetailsName').textContent = name;
+    const rowName = document.querySelector(`#chatList [data-group-id="${group.id}"] .person-name`);
+    if (rowName) rowName.textContent = name;
+    toast('Group details saved.');
+  }
+
+  async function updateGroupMemberRole(group, userId, role) {
+    const { error } = await db.from('group_members').update({ role }).eq('group_id', group.id).eq('user_id', userId);
+    if (error) return safeError(error, 'Could not update this member role. Apply the group management migration, then try again.');
+    openGroupDetails(group);
+  }
+  async function removeGroupMember(group, userId) {
+    if (!confirm('Remove this member from the group?')) return;
+    const { error } = await db.from('group_members').delete().eq('group_id', group.id).eq('user_id', userId);
+    if (error) return safeError(error, 'Could not remove this member. Apply the group management migration, then try again.');
+    openGroupDetails(group);
+  }
+  async function leaveLiveGroup() {
+    const group = window.surfActiveGroup; if (!group) return;
+    const { error } = await db.from('group_members').delete().eq('group_id', group.id).eq('user_id', window.surfCurrentUserId);
+    if (error) return safeError(error, 'Could not leave this group.');
+    closeModal('groupDetailsModal'); window.surfActiveGroupId = null; window.surfActiveGroup = null;
+    await loadLiveSurfWorkspace(); toast('You left the group.');
+  }
+  async function deleteLiveGroup() {
+    const group = window.surfActiveGroup; if (!group) return;
+    if (!confirm(`Delete “${group.name}” and its messages for everyone?`)) return;
+    const { error } = await db.from('group_conversations').delete().eq('id', group.id);
+    if (error) return safeError(error, 'Could not delete this group.');
+    closeModal('groupDetailsModal'); window.surfActiveGroupId = null; window.surfActiveGroup = null;
+    await loadLiveSurfWorkspace(); toast('Group deleted.');
+  }
+  async function uploadGroupAvatar(input) {
+    const group = window.surfActiveGroup, file = input?.files?.[0]; if (!group || !file) return;
+    if (!file.type.startsWith('image/')) return toast('Choose an image file.');
+    const path = `${group.id}/${window.surfCurrentUserId}/${Date.now()}-${file.name.replace(/[^a-zA-Z0-9._-]/g, '')}`;
+    const { error: uploadError } = await db.storage.from('surf-group-assets').upload(path, file, { upsert: true });
+    if (uploadError) return safeError(uploadError, 'Could not upload the group picture. Apply the group management migration first.');
+    const { error } = await db.from('group_conversations').update({ avatar_path: path }).eq('id', group.id);
+    if (error) return safeError(error, 'Picture uploaded, but the group could not be updated.');
+    group.avatar_path = path; const avatar = document.getElementById('groupDetailsAvatar');
+    avatar.style.backgroundImage = `url("${db.storage.from('surf-group-assets').getPublicUrl(path).data.publicUrl}")`; avatar.textContent = ''; toast('Group picture updated.');
+  }
 
   async function addLiveFriend() {
     const input = document.getElementById('addFriendInput');
@@ -1288,7 +1439,9 @@
     window.showProfilePage = function() {
       originalShowProfilePage();
       const person = activeProfile || selfProfile;
+      currentProfileOwnerId = person?.id || null;
       if (person?.id) loadProfilePosts(person.id);
+      if (person?.id && person.id !== window.surfCurrentUserId) loadProfileCounts(person.id);
       const pageAvatar = document.getElementById('pageAvatar');
       const avatarUrl = profileAssetUrl(person?.avatar_path);
       if (pageAvatar) {
@@ -1313,22 +1466,45 @@
     };
     window.showMyProfile = function() {
       if (!selfProfile) return;
+      currentProfileOwnerId = selfProfile.id;
       document.documentElement.style.removeProperty('--profile-banner');
       document.documentElement.style.removeProperty('--banner-size');
       document.documentElement.style.removeProperty('--banner-position');
       document.getElementById('pageName').textContent = selfProfile.username || 'Your profile';
       document.getElementById('pageHandle').textContent = selfProfile.handle || '';
       document.getElementById('pageBio').textContent = selfProfile.bio || '';
-      setEmpty(document.getElementById('profileGrid'), 'Your posts will appear here when you share them.');
-      document.querySelectorAll('#profileGrid .grid-post').forEach((item) => item.remove());
-      document.querySelectorAll('#profilePage .profile-stats b').forEach((item) => { item.textContent = '0'; });
+      document.querySelectorAll('.profile-tab').forEach((item, index) => item.classList.toggle('active', index === 0));
+      const profileGrid = document.getElementById('profileGrid');
+      if (profileGrid) profileGrid.dataset.view = 'posts';
       document.getElementById('profilePage').style.display = 'block';
       applyProfileAssets(selfProfile);
       loadProfilePosts(selfProfile.id);
+      updateOwnCounts();
       const age = document.getElementById('pageAgeBadge');
       if (age) { age.textContent = selfProfile.is_minor ? '🧒 Minor' : '18+'; age.style.display = 'inline-flex'; }
       renderSocialLinks(document.getElementById('pageSocialLinks'), selfProfile.social_links);
     };
+    window.saveStoryHighlight = saveStoryHighlight;
+    window.openGroupDetails = openGroupDetails;
+    window.saveGroupDetails = saveGroupDetails;
+    window.updateGroupMemberRole = updateGroupMemberRole;
+    window.removeGroupMember = removeGroupMember;
+    window.leaveLiveGroup = leaveLiveGroup;
+    window.deleteLiveGroup = deleteLiveGroup;
+    window.uploadGroupAvatar = uploadGroupAvatar;
+    window.openGroupDetails = openGroupDetails;
+  }
+
+  async function loadProfileCounts(ownerId) {
+    const [postCount, relationCount] = await Promise.all([
+      db.from('posts').select('id', { count: 'exact', head: true }).eq('owner_id', ownerId),
+      db.from('friend_requests').select('id', { count: 'exact', head: true }).eq('status', 'accepted').or(`requester_id.eq.${ownerId},addressee_id.eq.${ownerId}`)
+    ]);
+    if (postCount.error || relationCount.error) return;
+    const values = document.querySelectorAll('#profilePage .profile-stats b');
+    if (values[0]) values[0].textContent = String(postCount.count || 0);
+    if (values[1]) values[1].textContent = String(relationCount.count || 0);
+    if (values[2]) values[2].textContent = String(relationCount.count || 0);
   }
 
   async function restoreSupabaseSession() {
