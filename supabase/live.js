@@ -130,6 +130,45 @@
     }
   }
 
+
+  function bindSurfSearches() {
+    const messageSearch = document.querySelector('.search input, #messageSearch, input[placeholder*="Search messages"]');
+    if (messageSearch) {
+      messageSearch.placeholder = 'Search for friends or groups';
+      messageSearch.disabled = false;
+      messageSearch.addEventListener('input', () => {
+        const term = messageSearch.value.trim().toLowerCase();
+        document.querySelectorAll('#chatList .person').forEach(row => {
+          row.style.display = row.textContent.toLowerCase().includes(term) ? '' : 'none';
+        });
+        const discoverInput = document.getElementById('discoverInput');
+        if (term.length >= 2 && discoverInput) { discoverInput.value = messageSearch.value; renderDiscoverResults(); }
+      });
+      messageSearch.addEventListener('keydown', event => {
+        if (event.key === 'Enter' && messageSearch.value.trim().length >= 2) {
+          const discover = document.getElementById('discoverModal');
+          if (discover) { openModal('discoverModal'); const target = document.getElementById('discoverInput'); if (target) target.value = messageSearch.value; renderDiscoverResults(); }
+        }
+      });
+    }
+    const friendSearch = document.getElementById('friendsSearch');
+    if (friendSearch && !friendSearch.dataset.liveBound) { friendSearch.dataset.liveBound = '1'; friendSearch.addEventListener('input', () => loadFriendsAndRequests()); }
+  }
+
+  async function setLivePresence(status) {
+    if (!['online','dnd','offline'].includes(status)) return;
+    const userId = window.surfCurrentUserId;
+    if (!userId) return toast('Please sign in to change your status.');
+    const { error } = await db.from('profiles').update({ status, updated_at: new Date().toISOString() }).eq('id', userId);
+    if (error) return safeError(error, 'Could not update your status. Check profile update permissions.');
+    selfProfile = { ...(selfProfile || {}), status };
+    document.querySelectorAll('[data-presence]').forEach(button => button.classList.toggle('selected', button.dataset.presence === status));
+    const labels = { online: 'Online', dnd: 'Do not disturb', offline: 'Offline' };
+    const label = document.getElementById('myPresenceText'); if (label) label.textContent = labels[status];
+    localStorage.setItem('surfPresence', status);
+    toast('Status set to ' + labels[status]);
+  }
+
   async function loadLiveSurfWorkspace() {
     const userId = window.surfCurrentUserId;
     if (!userId) return;
@@ -176,6 +215,8 @@
       renderDiscoverResults();
       syncGroupPicker();
       bindSearches();
+      bindSurfSearches();
+      bindChatPhotoUpload();
       subscribeMessages();
       refreshNotifications(false);
     } catch (error) {
@@ -185,7 +226,7 @@
 
   async function latestMessages() {
     const id = window.surfCurrentUserId;
-      const { data, error } = await db.from('direct_messages').select('id,sender_id,recipient_id,body,created_at,delivered_at,read_at')
+      const { data, error } = await db.from('direct_messages').select('id,sender_id,recipient_id,body,media_path,created_at,delivered_at,read_at')
       .or(`sender_id.eq.${id},recipient_id.eq.${id}`).order('created_at', { ascending: false }).limit(200);
     if (error) throw error;
     return data || [];
@@ -260,7 +301,8 @@
     row.dataset.messageId = message.id || '';
     if (!mine) row.append(avatarNode(person, 'mini-avatar'));
     const wrap = document.createElement('div');
-    const bubble = document.createElement('div'); bubble.className = 'bubble'; bubble.textContent = message.body;
+    const bubble = document.createElement('div'); bubble.className = message.media_path ? 'photo-bubble' : 'bubble';
+    if (message.media_path) { const img = document.createElement('img'); img.alt = 'Shared photo'; img.style.cssText = 'width:245px;max-width:100%;max-height:300px;object-fit:cover;border-radius:12px;display:block'; db.storage.from('surf-chat-media').createSignedUrl(message.media_path, 3600).then(({data}) => { if (data?.signedUrl) img.src = data.signedUrl; }); bubble.append(img); if (message.body) { const caption = document.createElement('div'); caption.className = 'photo-caption'; caption.textContent = message.body; bubble.append(caption); } } else bubble.textContent = message.body;
     const stamp = document.createElement('div'); stamp.className = 'stamp';
     const sentTime = new Date(message.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     stamp.textContent = mine ? `${sentTime} · ${message.read_at && localReadReceiptsEnabled() && person?.read_receipts_enabled !== false ? 'Read' : message.delivered_at ? 'Delivered' : 'Sent'}` : sentTime;
@@ -271,7 +313,7 @@
     clearMessages(`Your conversation with ${person.display_name || person.username} will appear here.`);
     const current = window.surfCurrentUserId;
     const filter = `and(sender_id.eq.${current},recipient_id.eq.${person.id}),and(sender_id.eq.${person.id},recipient_id.eq.${current})`;
-    const { data, error } = await db.from('direct_messages').select('id,sender_id,recipient_id,body,created_at,delivered_at,read_at').or(filter).order('created_at');
+    const { data, error } = await db.from('direct_messages').select('id,sender_id,recipient_id,body,media_path,created_at,delivered_at,read_at').or(filter).order('created_at');
     if (error) return safeError(error, 'Could not load this conversation.');
     const incoming = (data || []).filter((message) => message.sender_id === person.id && (!message.delivered_at || (localReadReceiptsEnabled() && !message.read_at)));
     if (incoming.length) {
@@ -333,6 +375,26 @@
     playMessageSendTone();
     renderChatList();
     return true;
+  }
+
+
+  async function sendLiveImage(file) {
+    if (!file || !file.type.startsWith('image/')) return;
+    if (!window.surfCurrentUserId || !window.surfActiveRecipientId || window.surfActiveGroupId) return toast('Choose a direct conversation before sending a photo.');
+    if (file.size > 10 * 1024 * 1024) return toast('Choose an image smaller than 10 MB.');
+    const sender = window.surfCurrentUserId, recipient = window.surfActiveRecipientId;
+    const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(-80) || 'photo.jpg';
+    const path = `${sender}/${crypto.randomUUID()}-${safeName}`;
+    const { error: uploadError } = await db.storage.from('surf-chat-media').upload(path, file, { contentType: file.type, upsert: false });
+    if (uploadError) return safeError(uploadError, 'Could not upload this photo. Run the chat-media SQL migration first.');
+    const { data, error } = await db.from('direct_messages').insert({ sender_id: sender, recipient_id: recipient, body: '', media_path: path }).select('id,sender_id,recipient_id,body,media_path,created_at,delivered_at,read_at').single();
+    if (error) { await db.storage.from('surf-chat-media').remove([path]); return safeError(error, 'Could not send this photo.'); }
+    displayMessage(data, findPerson(recipient)); renderChatList(); toast('Photo sent.');
+  }
+
+  function bindChatPhotoUpload() {
+    const input = document.getElementById('photoInput');
+    if (input && !input.dataset.liveBound) { input.dataset.liveBound = '1'; input.addEventListener('change', async () => { const file = input.files?.[0]; input.value = ''; if (file) await sendLiveImage(file); }); }
   }
 
   function playMessageSendTone() {
@@ -428,9 +490,10 @@
   }
 
   async function answerRequest(relation, accepted) {
-    const { error } = await db.from('friend_requests').update({ status: accepted ? 'accepted' : 'declined', updated_at: new Date().toISOString() }).eq('id', relation.id);
-    if (error) return safeError(error, 'Could not update the friend request.');
-    await loadLiveSurfWorkspace(); toast(accepted ? 'Friend request accepted.' : 'Friend request declined.');
+    const { data, error } = await db.from('friend_requests').update({ status: accepted ? 'accepted' : 'declined', updated_at: new Date().toISOString() }).eq('id', relation.id).eq('status', 'pending').select('id,status').maybeSingle();
+    if (error) return safeError(error, 'Could not update the friend request. Check the friend-request database policies.');
+    if (!data) { await loadLiveSurfWorkspace(); return toast('This request has already changed. The list has been refreshed.'); }
+    await loadLiveSurfWorkspace(); await refreshNotifications(false); toast(accepted ? 'Friend request accepted.' : 'Friend request declined.');
   }
 
   function setFriendTab(tab, button) {
@@ -498,9 +561,10 @@
     document.getElementById('discoverBio').textContent = person.bio || 'No bio yet.';
     const discoverAge = document.getElementById('discoverAgeBadge'); if (discoverAge) { discoverAge.textContent = person.is_minor ? '🧒 Minor' : '18+'; discoverAge.style.display = 'inline-flex'; }
     renderSocialLinks(document.getElementById('discoverSocialLinks'), person.social_links);
-    document.getElementById('discoverPosts').textContent = '0';
-    document.getElementById('discoverFollowers').textContent = '0';
-    document.getElementById('discoverFollowing').textContent = '0';
+    const [postsCount, followersCount, followingCount] = await Promise.all([db.from('posts').select('id', { count: 'exact', head: true }).eq('owner_id', person.id), db.from('surf_follows').select('follower_id', { count: 'exact', head: true }).eq('followed_id', person.id), db.from('surf_follows').select('followed_id', { count: 'exact', head: true }).eq('follower_id', person.id)]);
+    document.getElementById('discoverPosts').textContent = String(postsCount.count ?? 0);
+    document.getElementById('discoverFollowers').textContent = String(followersCount.count ?? 0);
+    document.getElementById('discoverFollowing').textContent = String(followingCount.count ?? 0);
     const state = await requestStatus(person.id);
     document.getElementById('discoverFollowButton').textContent = ({ sent: 'Requested', received: 'Accept request', accepted: 'Unfriend' }[state] || 'Add friend');
     document.getElementById('discoverBlockLabel').textContent = 'Block';
@@ -522,9 +586,7 @@
       result = await db.from('friend_requests').update({ status: 'accepted', updated_at: new Date().toISOString() }).eq('id', match.id);
     } else if (state === 'accepted') {
       if (!confirm(`Are you sure you want to unfriend ${activeProfile.display_name || activeProfile.username}?`)) return;
-      result = match.requester_id === window.surfCurrentUserId
-        ? await db.from('friend_requests').delete().eq('id', match.id)
-        : await db.from('friend_requests').update({ status: 'declined', updated_at: new Date().toISOString() }).eq('id', match.id);
+      result = await db.from('friend_requests').delete().eq('id', match.id);
     }
     if (result?.error) return safeError(result.error, 'Could not update this connection.');
     await loadLiveSurfWorkspace();
@@ -672,14 +734,14 @@
     if (!localStorage.getItem(seenKey)) localStorage.setItem(seenKey, new Date().toISOString());
     const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
     const [requestResult, likeResult, postResult] = await Promise.all([
-      db.from('friend_requests').select('id,requester_id,addressee_id,status,created_at,updated_at').eq('addressee_id', userId).eq('status', 'pending').gte('created_at', since).order('created_at', { ascending: false }).limit(40),
+      db.from('friend_requests').select('id,requester_id,addressee_id,status,created_at,updated_at').or(`addressee_id.eq.${userId},requester_id.eq.${userId}`).in('status', ['pending','accepted']).gte('created_at', since).order('created_at', { ascending: false }).limit(40),
       db.from('story_likes').select('story_id,user_id,created_at').gte('created_at', since).order('created_at', { ascending: false }).limit(60),
       db.from('posts').select('id,owner_id,created_at').gte('created_at', since).order('created_at', { ascending: false }).limit(80)
     ]);
     const failed = [requestResult, likeResult, postResult].find((result) => result.error);
     if (failed) return safeError(failed.error, 'Could not load notifications.');
     const actors = [];
-    (requestResult.data || []).forEach((row) => actors.push({ id: row.requester_id, kind: 'request', row, created_at: row.created_at, text: 'sent you a friend request' }));
+    (requestResult.data || []).filter(row => row.addressee_id === userId && row.requester_id !== userId).forEach((row) => actors.push({ id: row.requester_id, kind: 'request', row, created_at: row.created_at, text: row.status === 'accepted' ? 'is now your friend' : 'sent you a friend request' }));
     const friendIds = new Set(friends.filter((person) => person.relation.status === 'accepted').map((person) => person.id));
     (postResult.data || []).filter((row) => row.owner_id !== userId && friendIds.has(row.owner_id)).forEach((row) => actors.push({ id: row.owner_id, kind: 'post', row, created_at: row.created_at, text: 'shared a new post' }));
     const likes = (likeResult.data || []).filter((row) => row.user_id !== userId);
@@ -722,7 +784,7 @@
       if (index >= 0) { openLiveStory({ owner: selfProfile, items: yourStories, isYours: true }); activeStoryIndex = index; renderLiveStoryViewer(); }
       return;
     }
-    if (item.kind === 'request') return openLiveProfile({ ...actor, ...(friends.find((friend) => friend.id === actor.id) || {}) });
+    if (item.kind === 'request') { await loadLiveSurfWorkspace(); return openLiveProfile({ ...actor, ...(friends.find((friend) => friend.id === actor.id) || {}) }); }
     if (item.kind === 'post') return openLiveProfile({ ...actor, ...(friends.find((friend) => friend.id === actor.id) || {}) });
   }
 
@@ -1619,4 +1681,5 @@
     document.getElementById('authError').textContent = error?.message || 'Could not restore your account. Please log in again.';
     showAuthPage('login');
   });
+  window.setMyPresence = setLivePresence;
 })();
