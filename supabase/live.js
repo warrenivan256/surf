@@ -2244,22 +2244,82 @@
   };
 
   async function restoreSupabaseSession() {
-    const { data, error } = await db.auth.getSession();
-    if (error) throw error;
-    if (data.session?.user) {
-      const profile = await window.loadSurfProfile(data.session.user);
-      window.enterApp(profile);
-    }
-    db.auth.onAuthStateChange((event) => {
+    // Register the listener before reading the stored session so refreshes and
+    // token restoration cannot race each other. Never await Supabase calls
+    // directly inside onAuthStateChange (that can deadlock the auth lock).
+    let restoringUserId = null;
+    const restoreUser = async (authUser) => {
+      if (!authUser?.id || restoringUserId === authUser.id || window.surfCurrentUserId === authUser.id) return;
+      restoringUserId = authUser.id;
+      try {
+        const profile = await window.loadSurfProfile(authUser);
+        window.enterApp(profile);
+      } catch (error) {
+        console.error('Surf profile restore failed:', error);
+        restoringUserId = null;
+        const errorBox = document.getElementById('authError');
+        if (errorBox) errorBox.textContent = 'Your session is saved, but your profile could not load. Please retry in a moment.';
+        showAuthPage('login');
+      }
+    };
+    db.auth.onAuthStateChange((event, session) => {
       if (event === 'SIGNED_OUT') {
+        restoringUserId = null;
         window.surfCurrentUserId = null;
         window.surfActiveRecipientId = null;
         window.surfActiveGroupId = null;
         window.enterApp(null);
         showAuthPage('login');
+      } else if (session?.user && ['INITIAL_SESSION', 'SIGNED_IN', 'TOKEN_REFRESHED', 'USER_UPDATED'].includes(event)) {
+        queueMicrotask(() => restoreUser(session.user));
       }
     });
+    const { data, error } = await db.auth.getSession();
+    if (error) throw error;
+    if (data.session?.user) {
+      await restoreUser(data.session.user);
+    }
   }
+
+  function integrateDiscoverIntoFriends() {
+    const friendsPage = document.querySelector('#friendsModal .friends-page');
+    const discoverPage = document.querySelector('#discoverModal .discover-page');
+    const tabs = document.querySelector('#friendsModal .friends-tabs');
+    if (!friendsPage || !discoverPage || !tabs || document.getElementById('friendsDiscoverPanel')) return;
+    const panel = document.createElement('section');
+    panel.id = 'friendsDiscoverPanel';
+    panel.className = 'friends-discover-panel';
+    panel.hidden = true;
+    const search = discoverPage.querySelector('.discover-search');
+    const subtitle = discoverPage.querySelector('.discover-subtitle');
+    const results = discoverPage.querySelector('#discoverResults');
+    if (search) panel.append(search);
+    if (subtitle) panel.append(subtitle);
+    if (results) panel.append(results);
+    friendsPage.append(panel);
+    const discoverTab = tabs.querySelector('.community-discover-tab');
+    if (discoverTab) {
+      discoverTab.dataset.friendTab = 'discover';
+      discoverTab.onclick = () => window.setFriendsTab('discover', discoverTab);
+    }
+    // The discover content now lives inside the same Friends & Discover surface.
+    const discoverOverlay = document.getElementById('discoverModal');
+    if (discoverOverlay) discoverOverlay.style.display = 'none';
+  }
+
+  function syncFriendsDiscoverView(tab) {
+    const discoverMode = tab === 'discover';
+    const panel = document.getElementById('friendsDiscoverPanel');
+    const search = document.querySelector('#friendsModal .friends-tools');
+    const addForm = document.getElementById('addFriendForm');
+    const content = document.getElementById('friendsContent');
+    if (panel) panel.hidden = !discoverMode;
+    if (search) search.hidden = discoverMode;
+    if (addForm) addForm.hidden = discoverMode;
+    if (content) content.hidden = discoverMode;
+    if (discoverMode) renderDiscoverResults();
+  }
+
 
   removeSeedContent();
   normalizeRailTooltips();
@@ -2279,6 +2339,36 @@
   window.toggleMuteCurrent = toggleLiveMute;
   window.renderFriendsList = loadFriendsAndRequests;
   window.setFriendsTab = setFriendTab;
+  const originalSetFriendTab = window.setFriendsTab;
+  window.setFriendsTab = function(tab, button) {
+    integrateDiscoverIntoFriends();
+    if (tab === 'discover') {
+      activeFriendTab = 'discover';
+      document.querySelectorAll('#friendsModal [data-friend-tab]').forEach((item) => item.classList.toggle('active', item === button));
+      syncFriendsDiscoverView('discover');
+      requestAnimationFrame(() => { const nav = document.querySelector('.friends-tabs'), active = nav?.querySelector('[data-friend-tab].active'), indicator = document.getElementById('friendsTabIndicator'); if (nav && active && indicator) { indicator.style.left = `${active.offsetLeft}px`; indicator.style.width = `${active.offsetWidth}px`; } });
+      return;
+    }
+    activeFriendTab = tab;
+    syncFriendsDiscoverView(tab);
+    if (typeof originalSetFriendTab === 'function') originalSetFriendTab(tab, button);
+  };
+  window.openDiscover = function() {
+    integrateDiscoverIntoFriends();
+    const modal = document.getElementById('friendsModal');
+    if (modal) { modal.style.display = 'grid'; modal.setAttribute('aria-hidden', 'false'); }
+    window.setFriendsTab('discover', document.querySelector('#friendsModal [data-friend-tab="discover"]'));
+    setTimeout(() => document.getElementById('discoverInput')?.focus(), 80);
+  };
+  window.openFriendsList = function() {
+    integrateDiscoverIntoFriends();
+    const modal = document.getElementById('friendsModal');
+    if (modal) { modal.style.display = 'grid'; modal.setAttribute('aria-hidden', 'false'); }
+    const defaultTab = document.querySelector('#friendsModal [data-friend-tab="all"]');
+    window.setFriendsTab('all', defaultTab);
+  };
+  integrateDiscoverIntoFriends();
+
   window.renderStoryViewer = renderLiveStoryViewer;
   window.stepStory = stepLiveStory;
   window.handleYourStoryClick = () => { if (yourStories.length) openLiveStory({ owner: selfProfile, items: yourStories, isYours: true }); else { resetStoryComposer(); openModal('storyModal'); } };
@@ -2327,7 +2417,7 @@
     else { const image = document.createElement('img'); image.src = url; image.alt = 'Post preview'; preview.append(image); }
   });
   window.createGroup = createLiveGroup;
-  window.openAddFriend = () => { openModal('discoverModal'); setTimeout(() => document.getElementById('discoverInput')?.focus(), 80); };
+  window.openAddFriend = () => { window.openDiscover(); };
   window.addFriendDemo = addLiveFriend;
   window.messageDiscoverPerson = async () => {
     if (!activeProfile) return;
