@@ -14,6 +14,8 @@
   let messageChannel = null;
   let pendingProfileImage = null;
   let pendingCropData = null;
+  let notificationItems = [];
+  let notificationRefreshTimer = null;
 
   const initials = (person) => (person?.display_name || person?.username || '?')
     .trim().split(/\s+/).slice(0, 2).map((part) => part[0]?.toUpperCase() || '').join('');
@@ -136,7 +138,7 @@
       requests = relations || [];
       const ids = [...new Set(requests.flatMap((rel) => rel.status === 'accepted' ? [rel.requester_id, rel.addressee_id] : [rel.requester_id, rel.addressee_id]).filter((id) => id !== userId))];
       if (ids.length) {
-        const { data: profiles, error } = await db.from('profiles').select('id,username,display_name,bio,status,created_at,avatar_path,banner_path').in('id', ids);
+        const { data: profiles, error } = await db.from('profiles').select('id,username,display_name,bio,status,created_at,avatar_path,banner_path,is_minor,social_links').in('id', ids);
         if (error) throw error;
         const byId = new Map((profiles || []).map((profile) => [profile.id, profile]));
         friends = requests.map((rel) => ({ ...byId.get(rel.requester_id === userId ? rel.addressee_id : rel.requester_id), relation: rel }))
@@ -148,6 +150,7 @@
       syncGroupPicker();
       bindSearches();
       subscribeMessages();
+      refreshNotifications(false);
     } catch (error) {
       safeError(error, 'Could not load your Surf account data. Check that the database setup completed.');
     }
@@ -271,9 +274,13 @@
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'direct_messages', filter: `recipient_id=eq.${window.surfCurrentUserId}` }, (payload) => {
         if (payload.new.sender_id === window.surfActiveRecipientId) displayMessage(payload.new, findPerson(payload.new.sender_id));
         renderChatList();
+        scheduleNotificationRefresh();
       }).on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'group_messages' }, (payload) => {
         if (payload.new.group_id === window.surfActiveGroupId && payload.new.sender_id !== window.surfCurrentUserId) displayMessage(payload.new, { username: 'Member' });
-      }).subscribe();
+      }).on('postgres_changes', { event: '*', schema: 'public', table: 'friend_requests', filter: 'addressee_id=eq.' + window.surfCurrentUserId }, () => scheduleNotificationRefresh())
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'friend_requests', filter: 'requester_id=eq.' + window.surfCurrentUserId }, () => scheduleNotificationRefresh())
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'stories' }, () => scheduleNotificationRefresh())
+        .subscribe();
   }
 
   async function loadFriendsAndRequests() {
@@ -337,8 +344,8 @@
     const term = raw.replace(/[^\p{L}\p{N} ._-]/gu, '').slice(0, 40);
     if (!term) return setEmpty(box, 'Enter a name or username to search.');
     const [byUsername, byName] = await Promise.all([
-      db.from('profiles').select('id,username,display_name,bio,status,created_at,avatar_path,banner_path').neq('id', window.surfCurrentUserId).ilike('username', `%${term}%`).limit(20),
-      db.from('profiles').select('id,username,display_name,bio,status,created_at,avatar_path,banner_path').neq('id', window.surfCurrentUserId).ilike('display_name', `%${term}%`).limit(20)
+      db.from('profiles').select('id,username,display_name,bio,status,created_at,avatar_path,banner_path,is_minor,social_links').neq('id', window.surfCurrentUserId).ilike('username', `%${term}%`).limit(20),
+      db.from('profiles').select('id,username,display_name,bio,status,created_at,avatar_path,banner_path,is_minor,social_links').neq('id', window.surfCurrentUserId).ilike('display_name', `%${term}%`).limit(20)
     ]);
     if (byUsername.error) return safeError(byUsername.error, 'Search is unavailable right now.');
     if (byName.error) return safeError(byName.error, 'Search is unavailable right now.');
@@ -377,6 +384,8 @@
     document.getElementById('discoverName').textContent = person.display_name || person.username;
     document.getElementById('discoverHandle').textContent = '@' + person.username + ' · ' + statusLabel(person.status).toLowerCase();
     document.getElementById('discoverBio').textContent = person.bio || 'No bio yet.';
+    const discoverAge = document.getElementById('discoverAgeBadge'); if (discoverAge) { discoverAge.textContent = person.is_minor ? '🧒 Minor' : '18+'; discoverAge.style.display = 'inline-flex'; }
+    renderSocialLinks(document.getElementById('discoverSocialLinks'), person.social_links);
     document.getElementById('discoverPosts').textContent = '0';
     document.getElementById('discoverFollowers').textContent = '0';
     document.getElementById('discoverFollowing').textContent = '0';
@@ -432,6 +441,174 @@
     toast(data ? 'User unmuted.' : 'User muted.');
   }
 
+
+  const socialPlatforms = {
+    youtube: { label: 'YouTube', hosts: ['youtube.com', 'youtu.be'], icon: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M23.5 6.2a3 3 0 0 0-2.1-2.1C19.5 3.6 12 3.6 12 3.6s-7.5 0-9.4.5A3 3 0 0 0 .5 6.2 31 31 0 0 0 0 12a31 31 0 0 0 .5 5.8 3 3 0 0 0 2.1 2.1c1.9.5 9.4.5 9.4.5s7.5 0 9.4-.5a3 3 0 0 0 2.1-2.1A31 31 0 0 0 24 12a31 31 0 0 0-.5-5.8ZM9.6 15.7V8.3l6.3 3.7-6.3 3.7Z"/></svg>' },
+    tiktok: { label: 'TikTok', hosts: ['tiktok.com'], icon: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19.6 6.7a4.8 4.8 0 0 1-3.8-4.2V2h-3.5v13.7a2.9 2.9 0 1 1-2.9-2.9c.3 0 .6 0 .9.1V9.4a6.7 6.7 0 1 0 5.5 6.6V9a8.3 8.3 0 0 0 4.8 1.5V7.1c-.3 0-.7-.1-1-.4Z"/></svg>' },
+    spotify: { label: 'Spotify', hosts: ['spotify.com'], icon: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 1.5A10.5 10.5 0 1 0 12 22.5 10.5 10.5 0 0 0 12 1.5Zm4.8 15.2a.8.8 0 0 1-1.1.3 11.3 11.3 0 0 0-8.6-1 .8.8 0 1 1-.5-1.5 12.8 12.8 0 0 1 9.9 1.1c.4.2.5.7.3 1.1Zm1.3-3a1 1 0 0 1-1.3.4 13.9 13.9 0 0 0-10.3-1.2 1 1 0 1 1-.6-1.9 15.9 15.9 0 0 1 11.8 1.4 1 1 0 0 1 .4 1.3Zm.1-3.1A16.8 16.8 0 0 0 5.6 9a1.2 1.2 0 1 1-.7-2.3 19.1 19.1 0 0 1 14.2 1.7 1.2 1.2 0 0 1-.9 2.2Z"/></svg>' }
+  };
+
+  function validSocialUrl(platform, value) {
+    const config = socialPlatforms[platform];
+    try {
+      const url = new URL(String(value || '').trim());
+      const host = url.hostname.toLowerCase().replace(/^www\./, '');
+      if (url.protocol !== 'https:' || !config || !config.hosts.some((domain) => host === domain || host.endsWith('.' + domain))) return '';
+      return url.href;
+    } catch { return ''; }
+  }
+
+  function renderSocialLinks(container, links) {
+    if (!container) return;
+    container.replaceChildren();
+    Object.entries(socialPlatforms).forEach(([platform, config]) => {
+      const url = validSocialUrl(platform, links?.[platform]);
+      if (!url) return;
+      const anchor = document.createElement('a');
+      anchor.className = 'link-badge';
+      anchor.href = url;
+      anchor.target = '_blank';
+      anchor.rel = 'noopener noreferrer';
+      anchor.setAttribute('aria-label', 'Open ' + config.label + ' profile');
+      anchor.title = config.label;
+      anchor.innerHTML = config.icon + '<span>' + config.label + '</span>';
+      container.append(anchor);
+    });
+    container.style.display = container.children.length ? 'flex' : 'none';
+  }
+
+  function renderSocialAccountSettings() {
+    const links = selfProfile?.social_links || {};
+    document.querySelectorAll('#accountsModal [data-platform]').forEach((row) => {
+      const platform = row.dataset.platform, config = socialPlatforms[platform], url = validSocialUrl(platform, links[platform]);
+      const label = row.querySelector('.account-meta span'), button = row.querySelector('.account-action'), icon = row.querySelector('.account-icon');
+      if (icon && config) icon.innerHTML = config.icon;
+      if (label) label.textContent = url || 'Not linked';
+      if (button) button.textContent = url ? 'Unlink' : 'Link';
+    });
+  }
+
+  async function toggleSocialAccount(platform, button) {
+    const config = socialPlatforms[platform];
+    if (!config || !selfProfile?.id) return toast('Sign in to manage linked accounts.');
+    const links = { ...(selfProfile.social_links || {}) };
+    if (validSocialUrl(platform, links[platform])) delete links[platform];
+    else {
+      const value = prompt('Paste your ' + config.label + ' profile URL (for example, https://www.' + config.hosts[0] + '/yourname):');
+      if (value === null) return;
+      const url = validSocialUrl(platform, value);
+      if (!url) return toast('Enter a secure ' + config.label + ' profile link.');
+      links[platform] = url;
+    }
+    const { data, error } = await db.from('profiles').update({ social_links: links, updated_at: new Date().toISOString() }).eq('id', selfProfile.id).select('id').maybeSingle();
+    if (error) return safeError(error, 'Could not save the linked account. Run the updated schema.sql, then try again.');
+    if (!data) return toast('Your profile could not be found. Sign in again and retry.');
+    selfProfile = { ...selfProfile, social_links: links };
+    renderSocialAccountSettings();
+    renderSocialLinks(document.getElementById('pageSocialLinks'), links);
+    toast(links[platform] ? config.label + ' profile linked.' : config.label + ' profile unlinked.');
+  }
+
+  function normalizeRailTooltips() {
+    document.querySelectorAll('.rail .navbtn').forEach((button) => {
+      const label = button.dataset.tooltip || button.getAttribute('title');
+      if (label) button.dataset.tooltip = label;
+      button.removeAttribute('title');
+    });
+  }
+
+  const notificationSeenKey = () => 'surf-notifications-seen:' + window.surfCurrentUserId;
+
+  function scheduleNotificationRefresh() {
+    clearTimeout(notificationRefreshTimer);
+    notificationRefreshTimer = setTimeout(() => refreshNotifications(false), 350);
+  }
+
+  function renderNotifications() {
+    const list = document.getElementById('notificationsList');
+    if (!list) return;
+    list.replaceChildren();
+    if (!notificationItems.length) return setEmpty(list, 'You’re all caught up. New messages, follow requests, and friends’ stories will show here.');
+    const lastSeen = Date.parse(localStorage.getItem(notificationSeenKey()) || '');
+    notificationItems.forEach((item) => {
+      const row = document.createElement('button');
+      row.type = 'button'; row.className = 'notification-item' + (Date.parse(item.created_at) > lastSeen ? ' unread' : '');
+      const avatar = avatarNode(item.actor || { username: '?' }, 'notification-item-avatar');
+      const url = profileAssetUrl(item.actor?.avatar_path);
+      if (url) { avatar.textContent = ''; avatar.style.backgroundImage = 'url("' + url + '")'; }
+      const copy = document.createElement('span'); copy.className = 'notification-item-copy';
+      copy.append(document.createTextNode(item.text));
+      const time = document.createElement('small'); time.textContent = new Date(item.created_at).toLocaleString(); copy.append(time);
+      const dot = document.createElement('i'); dot.className = 'notification-item-dot';
+      if (Date.parse(item.created_at) <= lastSeen) dot.style.visibility = 'hidden';
+      row.append(avatar, copy, dot);
+      row.onclick = () => handleNotification(item);
+      list.append(row);
+    });
+  }
+
+  async function refreshNotifications(markRead) {
+    const userId = window.surfCurrentUserId;
+    if (!userId) return;
+    const seenKey = notificationSeenKey();
+    if (!localStorage.getItem(seenKey)) localStorage.setItem(seenKey, new Date().toISOString());
+    const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    const [messageResult, requestResult, storyResult] = await Promise.all([
+      db.from('direct_messages').select('id,sender_id,body,created_at').eq('recipient_id', userId).neq('sender_id', userId).gte('created_at', since).order('created_at', { ascending: false }).limit(40),
+      db.from('friend_requests').select('id,requester_id,addressee_id,status,created_at,updated_at').or('requester_id.eq.' + userId + ',addressee_id.eq.' + userId).gte('updated_at', since).order('updated_at', { ascending: false }).limit(40),
+      db.from('stories').select('id,owner_id,kind,body,created_at,expires_at').neq('owner_id', userId).gt('expires_at', new Date().toISOString()).gte('created_at', since).order('created_at', { ascending: false }).limit(40)
+    ]);
+    const failed = [messageResult, requestResult, storyResult].find((result) => result.error);
+    if (failed) return safeError(failed.error, 'Could not load notifications.');
+    const relationRows = requestResult.data || [];
+    const followedIds = new Set(relationRows.filter((rel) => rel.status === 'accepted').map((rel) => rel.requester_id === userId ? rel.addressee_id : rel.requester_id));
+    const actors = [];
+    (messageResult.data || []).forEach((row) => actors.push({ id: row.sender_id, kind: 'message', row, created_at: row.created_at, text: 'sent you a message' }));
+    relationRows.forEach((row) => {
+      const incoming = row.addressee_id === userId && row.requester_id !== userId && row.status === 'pending';
+      const acceptedByOther = row.requester_id === userId && row.addressee_id !== userId && row.status === 'accepted' && row.updated_at > row.created_at;
+      if (incoming) actors.push({ id: row.requester_id, kind: 'request', row, created_at: row.updated_at, text: 'sent you a follow request' });
+      else if (acceptedByOther) actors.push({ id: row.addressee_id, kind: 'accepted', row, created_at: row.updated_at, text: 'accepted your follow request' });
+    });
+    (storyResult.data || []).filter((story) => followedIds.has(story.owner_id)).forEach((row) => actors.push({ id: row.owner_id, kind: 'story', row, created_at: row.created_at, text: 'shared a new story' }));
+    const ids = [...new Set(actors.map((item) => item.id))];
+    let people = new Map();
+    if (ids.length) {
+      const { data, error } = await db.from('profiles').select('id,username,display_name,bio,status,avatar_path,banner_path,is_minor,social_links').in('id', ids);
+      if (error) return safeError(error, 'Could not load notification profiles.');
+      people = new Map((data || []).map((profile) => [profile.id, profile]));
+    }
+    notificationItems = actors.map((item) => ({ ...item, actor: people.get(item.id) })).filter((item) => item.actor).sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+    if (markRead) localStorage.setItem(seenKey, new Date().toISOString());
+    const lastSeen = Date.parse(localStorage.getItem(seenKey) || '');
+    const unread = notificationItems.filter((item) => Date.parse(item.created_at) > lastSeen).length;
+    const badge = document.getElementById('notificationCount');
+    if (badge) { badge.textContent = unread > 99 ? '99+' : String(unread); badge.style.display = unread ? 'grid' : 'none'; }
+    renderNotifications();
+  }
+
+  async function openNotifications() {
+    openModal('notificationsModal');
+    await refreshNotifications(true);
+  }
+
+  async function handleNotification(item) {
+    closeModal('notificationsModal');
+    localStorage.setItem(notificationSeenKey(), new Date().toISOString());
+    refreshNotifications(false);
+    const actor = item.actor;
+    if (item.kind === 'story') {
+      await loadStories();
+      const entry = storySets.find((story) => story.owner.id === actor.id);
+      if (entry) openLiveStory(entry);
+      return;
+    }
+    const row = document.querySelector('#chatList [data-user-id="' + actor.id + '"]');
+    if (item.kind === 'message' && row) return selectLivePerson(row, findPerson(actor.id));
+    if (item.kind === 'request' || item.kind === 'accepted') return openLiveProfile({ ...actor, ...(friends.find((friend) => friend.id === actor.id) || {}) });
+    if (item.kind === 'message') toast('Add this person as a friend to open the conversation.');
+  }
+
   function renderStoriesStrip() {
     const strip = document.querySelector('.stories');
     if (!strip) return;
@@ -470,13 +647,13 @@
     yourStories = own;
     const avatar = document.getElementById('yourStoryAvatar');
     if (avatar) {
-      const first = own[0];
-      avatar.className = 'avatar' + (first?.kind === 'text' ? ' text-story-avatar' : '');
-      avatar.style.backgroundImage = first?.kind === 'image' ? `url("${first.url}")` : '';
-      avatar.style.backgroundColor = first?.kind === 'text' ? first.background_color : '';
+      avatar.className = 'avatar';
+      avatar.style.backgroundColor = '';
+      const avatarUrl = profileAssetUrl(selfProfile?.avatar_path);
+      avatar.style.backgroundImage = avatarUrl ? 'url("' + avatarUrl + '")' : '';
       avatar.style.backgroundSize = 'cover'; avatar.style.backgroundPosition = 'center';
-      avatar.textContent = first?.kind === 'text' ? first.body : first?.kind === 'image' ? '' : '＋';
-      document.getElementById('yourStoryLabel').textContent = own.length ? 'Your story · view' : 'Your story';
+      avatar.textContent = avatarUrl ? '' : initials(selfProfile || {});
+      document.getElementById('yourStoryLabel').textContent = own.length ? 'Your story · view' : 'Your story · share a moment';
     }
     const grouped = new Map();
     stories.filter((item) => item.owner_id !== window.surfCurrentUserId).forEach((story) => {
@@ -569,6 +746,8 @@
     document.getElementById('profileCardName').textContent = person.display_name || person.username;
     document.getElementById('profileCardHandle').textContent = '@' + person.username + ' · ' + statusLabel(person.status).toLowerCase();
     document.getElementById('profileCardBio').textContent = person.bio || 'No bio yet.';
+    const ageBadge = document.getElementById('profileCardAgeBadge'); if (ageBadge) { ageBadge.textContent = person.is_minor ? '🧒 Minor' : '18+'; ageBadge.style.display = 'inline-flex'; }
+    renderSocialLinks(document.getElementById('profileCardSocialLinks'), person.social_links);
     document.getElementById('profileCardAvatar').textContent = initials(person);
     const cardAvatarUrl = profileAssetUrl(person.avatar_path);
     const cardAvatar = document.getElementById('profileCardAvatar');
@@ -731,6 +910,7 @@
       if (user?.id) {
         selfProfile = user;
         window.surfCurrentUserId = user.id;
+        renderSocialAccountSettings();
         removeSeedContent();
         applyProfileAssets(user);
         document.getElementById('pageName').textContent = user.username || 'Your profile';
@@ -739,6 +919,14 @@
         loadLiveSurfWorkspace();
       }
       else { window.surfCurrentUserId = null; window.surfActiveRecipientId = null; window.surfActiveGroupId = null; }
+    };
+    const originalShowProfilePage = window.showProfilePage;
+    window.showProfilePage = function() {
+      originalShowProfilePage();
+      const person = activeProfile || selfProfile;
+      const badge = document.getElementById('pageAgeBadge');
+      if (badge && person) { badge.textContent = person.is_minor ? '🧒 Minor' : '18+'; badge.style.display = 'inline-flex'; }
+      renderSocialLinks(document.getElementById('pageSocialLinks'), person?.social_links);
     };
     window.showMyProfile = function() {
       if (!selfProfile) return;
@@ -753,6 +941,9 @@
       document.querySelectorAll('#profilePage .profile-stats b').forEach((item) => { item.textContent = '0'; });
       document.getElementById('profilePage').style.display = 'block';
       applyProfileAssets(selfProfile);
+      const age = document.getElementById('pageAgeBadge');
+      if (age) { age.textContent = selfProfile.is_minor ? '🧒 Minor' : '18+'; age.style.display = 'inline-flex'; }
+      renderSocialLinks(document.getElementById('pageSocialLinks'), selfProfile.social_links);
     };
   }
 
@@ -775,7 +966,11 @@
   }
 
   removeSeedContent();
+  normalizeRailTooltips();
+  renderSocialAccountSettings();
   enterAppWithLiveData();
+  window.openNotifications = openNotifications;
+  window.toggleAccount = toggleSocialAccount;
   window.selectPerson = (row) => { const person = friends.find((item) => item.id === row?.dataset.userId); if (person) return selectLivePerson(row, person); };
   window.appendMessage = sendLiveMessage;
   window.openProfile = openProfileForCurrentChat;
