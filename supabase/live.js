@@ -1744,8 +1744,11 @@
       const isOwnProfile = !!person?.id && person.id === window.surfCurrentUserId;
       const editBioButton = document.getElementById('editOwnBioButton');
       const followButton = document.getElementById('pageFollowButton');
+      const addHighlightButton = document.querySelector('#profileHighlightRow .profile-highlight-add');
       if (editBioButton) editBioButton.style.display = isOwnProfile ? 'inline-flex' : 'none';
       if (followButton) followButton.style.display = isOwnProfile ? 'none' : 'inline-flex';
+      // Only the owner of the currently viewed profile can add/manage highlights.
+      if (addHighlightButton) addHighlightButton.style.display = isOwnProfile ? 'grid' : 'none';
       if (person?.id) loadProfilePosts(person.id);
       if (person?.id && person.id !== window.surfCurrentUserId) loadProfileCounts(person.id);
       const pageAvatar = document.getElementById('pageAvatar');
@@ -1777,8 +1780,10 @@
       if (profilePage) profilePage.dataset.ownerId = selfProfile.id;
       const editBioButton = document.getElementById('editOwnBioButton');
       const followButton = document.getElementById('pageFollowButton');
+      const addHighlightButton = document.querySelector('#profileHighlightRow .profile-highlight-add');
       if (editBioButton) editBioButton.style.display = 'inline-flex';
       if (followButton) followButton.style.display = 'none';
+      if (addHighlightButton) addHighlightButton.style.display = 'grid';
       document.documentElement.style.removeProperty('--profile-banner');
       document.documentElement.style.removeProperty('--banner-size');
       document.documentElement.style.removeProperty('--banner-position');
