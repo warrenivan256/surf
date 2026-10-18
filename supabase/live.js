@@ -127,7 +127,7 @@
     if (!userId) return;
     try {
       const [{ data: relations, error: relationError }, { data: groupRows, error: groupError }] = await Promise.all([
-        db.from('friend_requests').select('id,requester_id,addressee_id,status,created_at').or(`requester_id.eq.${userId},addressee_id.eq.${userId}`),
+        db.from('friend_requests').select('id,requester_id,addressee_id,status,created_at,updated_at').or(`requester_id.eq.${userId},addressee_id.eq.${userId}`),
         db.from('group_conversations').select('id,name,owner_id,created_at').order('created_at', { ascending: false })
       ]);
       if (relationError) throw relationError;
@@ -141,13 +141,21 @@
         if (ownerMembershipError) throw ownerMembershipError;
       }
       requests = relations || [];
-      const ids = [...new Set(requests.flatMap((rel) => rel.status === 'accepted' ? [rel.requester_id, rel.addressee_id] : [rel.requester_id, rel.addressee_id]).filter((id) => id !== userId))];
+      const ids = [...new Set(requests.flatMap((rel) => [rel.requester_id, rel.addressee_id]).filter((id) => id !== userId))];
       if (ids.length) {
         const { data: profiles, error } = await db.from('profiles').select('id,username,display_name,bio,status,created_at,avatar_path,banner_path,is_minor,social_links').in('id', ids);
         if (error) throw error;
         const byId = new Map((profiles || []).map((profile) => [profile.id, profile]));
-        friends = requests.map((rel) => ({ ...byId.get(rel.requester_id === userId ? rel.addressee_id : rel.requester_id), relation: rel }))
-          .filter((person) => person.id);
+        const relationsByPerson = new Map();
+        requests.forEach((rel) => {
+          const personId = rel.requester_id === userId ? rel.addressee_id : rel.requester_id;
+          if (!relationsByPerson.has(personId)) relationsByPerson.set(personId, []);
+          relationsByPerson.get(personId).push(rel);
+        });
+        friends = [...relationsByPerson.entries()].map(([personId, matches]) => {
+          const relation = preferredRelationship(matches, userId);
+          return { ...byId.get(personId), relation };
+        }).filter((person) => person.id);
       } else friends = [];
       groups = groupRows || [];
       await Promise.all([renderChatList(), renderFriendsList(), loadStories(), updateOwnCounts()]);
@@ -374,8 +382,16 @@
     if (!data?.length) setEmpty(box, 'No Surf users found with that name yet.');
   }
 
+  function preferredRelationship(matches, userId = window.surfCurrentUserId) {
+    return [...matches].sort((a, b) => {
+      const rank = (row) => row.status === 'accepted' ? 4 : row.status === 'pending' && row.addressee_id === userId ? 3 : row.status === 'pending' ? 2 : 1;
+      return rank(b) - rank(a) || Date.parse(b.updated_at || b.created_at) - Date.parse(a.updated_at || a.created_at);
+    })[0];
+  }
+
   async function requestStatus(personId) {
-    const row = requests.find((item) => (item.requester_id === personId && item.addressee_id === window.surfCurrentUserId) || (item.addressee_id === personId && item.requester_id === window.surfCurrentUserId));
+    const matches = requests.filter((item) => (item.requester_id === personId && item.addressee_id === window.surfCurrentUserId) || (item.addressee_id === personId && item.requester_id === window.surfCurrentUserId));
+    const row = matches.length ? preferredRelationship(matches) : null;
     if (!row) return 'none';
     return row.status === 'pending' ? (row.requester_id === window.surfCurrentUserId ? 'sent' : 'received') : row.status;
   }
@@ -409,7 +425,8 @@
     if (!activeProfile) return;
     const state = await requestStatus(activeProfile.id);
     let result;
-    const match = requests.find((item) => (item.requester_id === activeProfile.id && item.addressee_id === window.surfCurrentUserId) || (item.addressee_id === activeProfile.id && item.requester_id === window.surfCurrentUserId));
+    const matches = requests.filter((item) => (item.requester_id === activeProfile.id && item.addressee_id === window.surfCurrentUserId) || (item.addressee_id === activeProfile.id && item.requester_id === window.surfCurrentUserId));
+    const match = matches.length ? preferredRelationship(matches) : null;
     if (state === 'none' || state === 'declined' || state === 'cancelled') {
       result = await db.from('friend_requests').insert({ requester_id: window.surfCurrentUserId, addressee_id: activeProfile.id });
     } else if (state === 'sent') {
@@ -938,6 +955,24 @@
     window.showProfilePage = function() {
       originalShowProfilePage();
       const person = activeProfile || selfProfile;
+      const pageAvatar = document.getElementById('pageAvatar');
+      const avatarUrl = profileAssetUrl(person?.avatar_path);
+      if (pageAvatar) {
+        pageAvatar.textContent = avatarUrl ? '' : initials(person || {});
+        pageAvatar.style.backgroundImage = avatarUrl ? `url("${avatarUrl}")` : '';
+        pageAvatar.style.backgroundSize = 'cover';
+        pageAvatar.style.backgroundPosition = 'center';
+      }
+      const bannerUrl = profileAssetUrl(person?.banner_path);
+      if (bannerUrl) {
+        document.documentElement.style.setProperty('--profile-banner', `url("${bannerUrl}")`);
+        document.documentElement.style.setProperty('--banner-size', 'cover');
+        document.documentElement.style.setProperty('--banner-position', 'center');
+      } else {
+        document.documentElement.style.removeProperty('--profile-banner');
+        document.documentElement.style.removeProperty('--banner-size');
+        document.documentElement.style.removeProperty('--banner-position');
+      }
       const badge = document.getElementById('pageAgeBadge');
       if (badge && person) { badge.textContent = person.is_minor ? '🧒 Minor' : '18+'; badge.style.display = 'inline-flex'; }
       renderSocialLinks(document.getElementById('pageSocialLinks'), person?.social_links);
