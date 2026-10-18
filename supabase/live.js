@@ -1119,32 +1119,43 @@
   async function openPostDetail(post, mediaUrl) {
     let modal = document.getElementById('postDetailModal');
     if (!modal) {
-      modal = document.createElement('div'); modal.id='postDetailModal'; modal.className='modal-back';
-      modal.style.zIndex = '10020';
-      modal.innerHTML='<section class="modal post-detail-modal"><button class="close" type="button" data-close>×</button><div class="post-detail-layout"><div class="post-detail-media"></div><aside><h2>Post</h2><p class="post-detail-caption"></p><div class="post-detail-actions"><button type="button" data-like>♡ Like <span>0</span></button><button type="button" data-focus-comment>Comment</button><button type="button" data-save>Save</button></div><div class="post-comments"></div><form class="post-comment-form"><input maxlength="1000" placeholder="Write a comment…" required><button class="btn primary">Send</button></form></aside></div></section>';
+      modal = document.createElement('div'); modal.id='postDetailModal'; modal.className='modal-back'; modal.style.zIndex='10020';
+      modal.innerHTML='<section class="modal post-detail-modal"><button class="close" type="button" data-close aria-label="Close post">×</button><div class="post-detail-layout"><div class="post-detail-media"></div><aside><div class="post-detail-heading"><img class="post-author-avatar" alt=""><div><div class="post-author-name"></div><p class="post-detail-caption"></p></div></div><div class="post-detail-actions"><button type="button" data-like>♡ Like <span>0</span></button><button type="button" data-focus-comment>Comment</button><button type="button" data-save>Save</button></div><div class="post-comments"></div><form class="post-comment-form"><input maxlength="1000" placeholder="Write a comment…" required><button class="btn primary">Send</button></form></aside></div></section>';
       document.body.append(modal); modal.addEventListener('click',e=>{if(e.target===modal||e.target.closest('[data-close]'))modal.style.display='none';});
     }
+    modal.dataset.postId=post.id;
     modal.querySelector('.post-detail-media').replaceChildren();
-    if (mediaUrl) { const media = post.media_type==='video' ? document.createElement('video') : document.createElement('img'); media.src=mediaUrl; if(media.tagName==='VIDEO')media.controls=true; media.alt='Post media'; modal.querySelector('.post-detail-media').append(media); }
-    modal.querySelector('.post-detail-caption').textContent=post.caption||'';
-    const likeBtn=modal.querySelector('[data-like]'), commentsBox=modal.querySelector('.post-comments'), form=modal.querySelector('.post-comment-form');
+    if(mediaUrl){const media=post.media_type==='video'?document.createElement('video'):document.createElement('img');media.src=mediaUrl;if(media.tagName==='VIDEO')media.controls=true;media.alt='Post media';modal.querySelector('.post-detail-media').append(media);}
+    const caption=modal.querySelector('.post-detail-caption');caption.textContent=post.caption||'';
+    const authorAvatar=modal.querySelector('.post-author-avatar'),authorName=modal.querySelector('.post-author-name');
+    const {data:author}=await db.from('profiles').select('id,username,display_name,avatar_path').eq('id',post.owner_id).maybeSingle();
+    authorName.textContent=author?.display_name||author?.username||'User';
+    authorAvatar.src=author?.avatar_path?db.storage.from('surf-profile-assets').getPublicUrl(author.avatar_path).data.publicUrl:'';
+    authorAvatar.style.display=authorAvatar.src?'block':'none';
+    const likeBtn=modal.querySelector('[data-like]'),commentsBox=modal.querySelector('.post-comments'),form=modal.querySelector('.post-comment-form');
+    const blockedTerms=['fuck','fucking','motherfucker','shit','bullshit','bitch','bastard','asshole','dickhead','cunt','piss off','slut','whore','retard','kys'];
+    function censor(text){if(localStorage.getItem('surfPref_commentFilter')==='false')return text;let result=text;for(const term of blockedTerms){const re=new RegExp('\\b'+term.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'\\b','gi');result=result.replace(re,'*'.repeat(Math.min(term.length,8)));}return result;}
     async function refreshPostSocial(){
-      const [{count:likes},{data:mine},{data:comments,error}] = await Promise.all([
+      const [{count:likes},{data:mine},{data:comments,error}]=await Promise.all([
         db.from('post_likes').select('post_id',{count:'exact',head:true}).eq('post_id',post.id),
         db.from('post_likes').select('post_id').eq('post_id',post.id).eq('user_id',window.surfCurrentUserId).maybeSingle(),
-        db.from('post_comments').select('id,user_id,body,created_at').eq('post_id',post.id).order('created_at')
+        db.from('post_comments').select('id,user_id,body,created_at,parent_comment_id').eq('post_id',post.id).order('created_at')
       ]);
-      if(error) { commentsBox.textContent='Comments unavailable. Apply the post-interactions SQL migration.'; return; }
-      likeBtn.innerHTML=(mine?'♥':'♡')+' Like <span>'+(likes||0)+'</span>'; likeBtn.dataset.liked=mine?'1':'0'; commentsBox.replaceChildren();
-      const ids=[...new Set((comments||[]).map(c=>c.user_id))]; let profiles=[]; if(ids.length){const r=await db.from('profiles').select('id,username,display_name').in('id',ids);profiles=r.data||[];}
-      (comments||[]).forEach(c=>{const p=profiles.find(x=>x.id===c.user_id);const row=document.createElement('p');const b=document.createElement('b');b.textContent=(p?.display_name||p?.username||'User')+': ';row.append(b,document.createTextNode(c.body));commentsBox.append(row);});
+      if(error){commentsBox.textContent='Comments unavailable. Apply the updated post-interactions SQL migration.';return;}
+      likeBtn.innerHTML=(mine?'♥':'♡')+' Like <span>'+(likes||0)+'</span>';likeBtn.dataset.liked=mine?'1':'0';commentsBox.replaceChildren();
+      const ids=[...new Set([...(comments||[]).map(c=>c.user_id),post.owner_id])];let profiles=[];if(ids.length){const r=await db.from('profiles').select('id,username,display_name,avatar_path').in('id',ids);profiles=r.data||[];}
+      const byId=new Map(profiles.map(p=>[p.id,p]));const own=window.surfCurrentUserId;
+      const renderComment=(c,depth=0)=>{const p=byId.get(c.user_id),row=document.createElement('div');row.className='post-comment';row.style.marginLeft=depth?'24px':'0';const avatar=document.createElement('img');avatar.className='post-comment-avatar';avatar.alt='';if(p?.avatar_path)avatar.src=db.storage.from('surf-profile-assets').getPublicUrl(p.avatar_path).data.publicUrl;const body=document.createElement('div');body.className='post-comment-body';const username=document.createElement('strong');username.textContent=p?.display_name||p?.username||'User';const text=document.createElement('p');text.textContent=censor(c.body);body.append(username,text);const tools=document.createElement('div');tools.className='post-comment-tools';const reply=document.createElement('button');reply.type='button';reply.textContent='Reply';reply.onclick=()=>{let replyForm=row.querySelector('.post-comment-reply');if(replyForm){replyForm.remove();return;}replyForm=document.createElement('form');replyForm.className='post-comment-reply';const input=document.createElement('input');input.maxLength=1000;input.placeholder='Write a reply…';input.required=true;const send=document.createElement('button');send.className='btn primary';send.textContent='Reply';replyForm.append(input,send);replyForm.onsubmit=async e=>{e.preventDefault();const bodyText=input.value.trim();if(!bodyText)return;const payload={post_id:post.id,user_id:own,body:censor(bodyText),parent_comment_id:c.id};const r=await db.from('post_comments').insert(payload);if(r.error)return safeError(r.error,'Could not reply. Run the updated post-interactions migration first.');await refreshPostSocial();};body.append(replyForm);input.focus();};tools.append(reply);
+        if(c.user_id===own||post.owner_id===own){const del=document.createElement('button');del.type='button';del.textContent='Delete';del.onclick=async()=>{if(!confirm('Delete this comment?'))return;const r=await db.from('post_comments').delete().eq('id',c.id);if(r.error)return safeError(r.error,'Could not delete comment. Apply the updated SQL migration.');await refreshPostSocial();};tools.append(del);}body.append(tools);row.append(avatar,body);commentsBox.append(row);};
+      const roots=(comments||[]).filter(c=>!c.parent_comment_id),children=(comments||[]).filter(c=>c.parent_comment_id);roots.forEach(c=>{renderComment(c);children.filter(r=>r.parent_comment_id===c.id).forEach(r=>renderComment(r,1));});
     }
     likeBtn.onclick=async()=>{const liked=likeBtn.dataset.liked==='1';const result=liked?await db.from('post_likes').delete().eq('post_id',post.id).eq('user_id',window.surfCurrentUserId):await db.from('post_likes').insert({post_id:post.id,user_id:window.surfCurrentUserId});if(result.error)return safeError(result.error,'Could not update like. Apply post-interactions SQL migration.');await refreshPostSocial();};
     modal.querySelector('[data-focus-comment]').onclick=()=>form.querySelector('input').focus();
     modal.querySelector('[data-save]').onclick=async()=>{const r=await db.from('saved_posts').select('post_id').eq('post_id',post.id).eq('user_id',window.surfCurrentUserId).maybeSingle();if(r.error)return safeError(r.error,'Could not check saved post.');const x=r.data?await db.from('saved_posts').delete().eq('post_id',post.id).eq('user_id',window.surfCurrentUserId):await db.from('saved_posts').insert({post_id:post.id,user_id:window.surfCurrentUserId});if(x.error)return safeError(x.error,'Could not save post.');toast(r.data?'Post unsaved':'Post saved');};
-    form.onsubmit=async e=>{e.preventDefault();const input=form.querySelector('input'),body=input.value.trim();if(!body)return;const r=await db.from('post_comments').insert({post_id:post.id,user_id:window.surfCurrentUserId,body});if(r.error)return safeError(r.error,'Could not post comment. Apply post-interactions SQL migration.');input.value='';await refreshPostSocial();};
-    await refreshPostSocial(); modal.style.zIndex='10020'; modal.style.display='grid';
+    form.onsubmit=async e=>{e.preventDefault();const input=form.querySelector('input'),body=input.value.trim();if(!body)return;const result=await db.from('post_comments').insert({post_id:post.id,user_id:window.surfCurrentUserId,body:censor(body)});if(result.error)return safeError(result.error,'Could not post comment. Apply the updated post-interactions SQL migration.');input.value='';await refreshPostSocial();};
+    await refreshPostSocial();modal.style.zIndex='10020';modal.style.display='grid';
   }
+
   async function openFollowList(kind, ownerId = window.surfCurrentUserId) {
     const column=kind==='followers'?'follower_id':'followed_id';
     const {data,error}=await db.from('surf_follows').select('follower_id,followed_id').eq(kind==='followers'?'followed_id':'follower_id',ownerId);
