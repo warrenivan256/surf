@@ -30,6 +30,8 @@
   let surfFeedDraftFile = null;
   let surfFeedChannel = null;
   let surfFeedRows = [];
+  const expandedSurfFeedComments = new Set();
+  const surfMutedProfileIds = new Set(JSON.parse(localStorage.getItem('surfMutedProfileIds') || '[]'));
 
   const initials = (person) => (person?.display_name || person?.username || '?')
     .trim().split(/\s+/).slice(0, 2).map((part) => part[0]?.toUpperCase() || '').join('');
@@ -1191,26 +1193,29 @@
     if (surfFeedTab === 'following') {
       const { data: follows, error: followError } = await db.from('surf_follows').select('followed_id').eq('follower_id', window.surfCurrentUserId);
       if (followError) return showSurfFeedError(followError, 'Could not load the Following timeline.');
-      followedIds = (follows || []).map((row) => row.followed_id);
+      followedIds = (follows || []).map((row) => row.followed_id).filter((id) => id && id !== window.surfCurrentUserId);
     }
     let query = db.from('surf_feed_posts').select('*').order('created_at', { ascending: false }).limit(80);
-    if (surfFeedTab === 'following') query = query.in('owner_id', [...new Set([window.surfCurrentUserId, ...followedIds])]);
+    if (surfFeedTab === 'following') {
+      if (!followedIds.length) { surfFeedRows = []; list.innerHTML = '<div class="surf-feed-empty"><b>No posts from people you follow yet.</b><br>Follow people to see their posts here.</div>'; return; }
+      query = query.in('owner_id', [...new Set(followedIds)]);
+    }
     const { data: posts, error } = await query;
     if (error) return showSurfFeedError(error, 'Could not load Surf Feed. Run surf-feed.sql in Supabase first.');
     surfFeedRows = posts || [];
     if (!surfFeedRows.length) { list.innerHTML = `<div class="surf-feed-empty"><b>${surfFeedTab === 'following' ? 'No posts from people you follow yet.' : 'Your timeline starts here.'}</b><br>Share a thought, photo, or video with Surf.</div>`; return; }
-    const ownerIds = [...new Set(surfFeedRows.map((post) => post.owner_id))];
-    const { data: profiles, error: profileError } = await db.from('profiles').select('id,username,display_name,avatar_path').in('id', ownerIds);
-    if (profileError) console.warn('Feed profiles could not be loaded:', profileError.message);
-    const profileMap = new Map((profiles || []).map((profile) => [profile.id, profile]));
     const postIds = surfFeedRows.map((post) => post.id);
     const [likesResult, repostsResult, commentsResult, savedResult] = await Promise.all([
       db.from('surf_feed_likes').select('post_id,user_id').in('post_id', postIds),
       db.from('surf_feed_reposts').select('post_id,user_id').in('post_id', postIds),
-      db.from('surf_feed_comments').select('post_id').in('post_id', postIds),
+      db.from('surf_feed_comments').select('id,post_id,user_id,body,created_at').in('post_id', postIds).order('created_at', { ascending: true }),
       db.from('surf_feed_saved_posts').select('post_id').eq('user_id', window.surfCurrentUserId).in('post_id', postIds)
     ]);
     const likes = likesResult.data || [], reposts = repostsResult.data || [], comments = commentsResult.data || [], saved = new Set((savedResult.data || []).map((row) => row.post_id));
+    const ownerIds = [...new Set([...surfFeedRows.map((post) => post.owner_id), ...comments.map((comment) => comment.user_id)])];
+    const { data: profiles, error: profileError } = await db.from('profiles').select('id,username,display_name,avatar_path').in('id', ownerIds);
+    if (profileError) console.warn('Feed profiles could not be loaded:', profileError.message);
+    const profileMap = new Map((profiles || []).map((profile) => [profile.id, profile]));
     const liked = new Set(likes.filter((row) => row.user_id === window.surfCurrentUserId).map((row) => row.post_id));
     const reposted = new Set(reposts.filter((row) => row.user_id === window.surfCurrentUserId).map((row) => row.post_id));
     list.replaceChildren();
@@ -1225,6 +1230,11 @@
       const dot = document.createElement('span'); dot.textContent = '·';
       const time = document.createElement('span'); time.className = 'feed-time'; time.textContent = feedTimeLabel(post.created_at);
       author.append(name, handle, dot, time);
+      if (post.owner_id === window.surfCurrentUserId) {
+        const deletePost = document.createElement('button'); deletePost.type = 'button'; deletePost.className = 'surf-feed-delete-post'; deletePost.title = 'Delete your post'; deletePost.setAttribute('aria-label', 'Delete your post'); deletePost.textContent = '•••';
+        deletePost.onclick = (event) => { event.stopPropagation(); deleteSurfFeedPost(post); };
+        author.append(deletePost);
+      }
       const body = document.createElement('div'); body.className = 'surf-feed-body'; body.textContent = post.body || '';
       main.append(author, body);
       if (post.media_path) {
@@ -1256,9 +1266,21 @@
       };
       actionBar.append(makeAction('comment', postComments, '', 'Reply'), makeAction('repost', postReposts, reposted.has(post.id) ? 'reposted' : '', 'Repost'), makeAction('like', postLikes, liked.has(post.id) ? 'liked' : '', 'Like'), makeAction('save', null, saved.has(post.id) ? 'saved' : '', 'Save'), makeAction('share', null, '', 'Share'));
       main.append(actionBar);
-      const form = document.createElement('form'); form.className = 'surf-feed-comment-form'; form.innerHTML = '<input maxlength="1000" placeholder="Write a reply…" aria-label="Write a reply" required><button type="submit">Reply</button>';
-      form.onsubmit = async (event) => { event.preventDefault(); const input = form.querySelector('input'); const bodyText = input.value.trim(); if (!bodyText) return; const { error: commentError } = await db.from('surf_feed_comments').insert({ post_id: post.id, user_id: window.surfCurrentUserId, body: bodyText }); if (commentError) return safeError(commentError, 'Could not send reply.'); toast('Reply posted.'); await loadSurfFeed(); };
-      main.append(form); card.append(avatar, main); list.append(card);
+      const commentPanel = document.createElement('div'); commentPanel.className = 'surf-feed-comments' + (expandedSurfFeedComments.has(post.id) ? ' open' : ''); commentPanel.dataset.postId = post.id;
+      const postCommentRows = comments.filter((comment) => comment.post_id === post.id);
+      if (!postCommentRows.length) { const emptyComments = document.createElement('div'); emptyComments.className = 'surf-feed-empty'; emptyComments.style.padding = '10px 0'; emptyComments.textContent = 'No replies yet. Be the first to reply.'; commentPanel.append(emptyComments); }
+      postCommentRows.forEach((comment) => {
+        const commentOwner = profileMap.get(comment.user_id) || { username: 'Surf member', display_name: 'Surf member' };
+        const item = document.createElement('div'); item.className = 'surf-feed-comment-item';
+        const commentAvatar = document.createElement('div'); commentAvatar.className = 'surf-feed-comment-avatar'; const commentAvatarUrl = profileAssetUrl(commentOwner.avatar_path); commentAvatar.style.backgroundImage = commentAvatarUrl ? `url("${commentAvatarUrl}")` : ''; commentAvatar.textContent = commentAvatarUrl ? '' : initials(commentOwner);
+        const content = document.createElement('div'); content.className = 'surf-feed-comment-content';
+        const meta = document.createElement('div'); meta.className = 'surf-feed-comment-meta'; const commentName = document.createElement('b'); commentName.textContent = commentOwner.display_name || commentOwner.username || 'Surf member'; const commentHandle = document.createElement('span'); commentHandle.textContent = '@' + (commentOwner.username || 'member'); const commentTime = document.createElement('span'); commentTime.textContent = '· ' + feedTimeLabel(comment.created_at); meta.append(commentName, commentHandle, commentTime);
+        if (comment.user_id === window.surfCurrentUserId) { const deleteComment = document.createElement('button'); deleteComment.type = 'button'; deleteComment.className = 'surf-feed-delete-comment'; deleteComment.textContent = '×'; deleteComment.title = 'Delete your reply'; deleteComment.onclick = async () => { if (!confirm('Delete this reply?')) return; const { error: deleteError } = await db.from('surf_feed_comments').delete().eq('id', comment.id).eq('user_id', window.surfCurrentUserId); if (deleteError) return safeError(deleteError, 'Could not delete reply.'); await loadSurfFeed(); }; meta.append(deleteComment); }
+        const text = document.createElement('div'); text.textContent = comment.body; content.append(meta, text); item.append(commentAvatar, content); commentPanel.append(item);
+      });
+      const form = document.createElement('form'); form.className = 'surf-feed-comment-form' + (expandedSurfFeedComments.has(post.id) ? ' open' : ''); form.innerHTML = '<input maxlength="1000" placeholder="Write a reply…" aria-label="Write a reply" required><button type="submit">Reply</button>';
+      form.onsubmit = async (event) => { event.preventDefault(); const input = form.querySelector('input'); const bodyText = input.value.trim(); if (!bodyText) return; const { error: commentError } = await db.from('surf_feed_comments').insert({ post_id: post.id, user_id: window.surfCurrentUserId, body: bodyText }); if (commentError) return safeError(commentError, 'Could not send reply.'); expandedSurfFeedComments.add(post.id); toast('Reply posted.'); await loadSurfFeed(); };
+      main.append(commentPanel, form); card.append(avatar, main); list.append(card);
     }
   }
   function showSurfFeedError(error, fallback) { console.error(error); const list = document.getElementById('surfFeedList'); if (list) list.innerHTML = `<div class="surf-feed-error">${escapeText(error?.message || fallback)}</div>`; }
@@ -1285,6 +1307,20 @@
     } catch (error) { safeError(error, 'Could not publish your post. Check the Surf Feed database setup.'); }
     finally { button.disabled = false; button.textContent = 'Post'; }
   }
+  function focusSurfFeedComposer() {
+    const composer = document.getElementById('surfFeedComposerText');
+    if (!composer) return;
+    composer.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    setTimeout(() => composer.focus({ preventScroll: true }), 180);
+  }
+  async function deleteSurfFeedPost(post) {
+    if (!post || post.owner_id !== window.surfCurrentUserId) return toast('You can only delete your own posts.');
+    if (!confirm('Delete this post? Its replies, likes, reposts, and saves will be removed too.')) return;
+    const { error } = await db.from('surf_feed_posts').delete().eq('id', post.id).eq('owner_id', window.surfCurrentUserId);
+    if (error) return safeError(error, 'Could not delete your post.');
+    if (post.media_path) { const { error: storageError } = await db.storage.from('surf-feed-media').remove([post.media_path]); if (storageError) console.warn('Post deleted but media cleanup failed:', storageError.message); }
+    expandedSurfFeedComments.delete(post.id); toast('Post deleted.'); await loadSurfFeed();
+  }
   async function toggleSurfFeedLike(postId, button) {
     const { data, error } = await db.from('surf_feed_likes').select('post_id').eq('post_id', postId).eq('user_id', window.surfCurrentUserId).maybeSingle();
     if (error) return safeError(error, 'Could not check like.');
@@ -1306,8 +1342,8 @@
     if (result.error) return safeError(result.error, 'Could not save post.');
     await loadSurfFeed(); toast(data ? 'Post removed from saved.' : 'Post saved.');
   }
-  function toggleSurfFeedCommentForm(card) { const form = card.querySelector('.surf-feed-comment-form'); if (!form) return; form.classList.toggle('open'); if (form.classList.contains('open')) form.querySelector('input')?.focus(); }
-  async function shareSurfFeedPost(postId) { const url = location.origin + location.pathname + '#surf-feed-' + postId; try { await navigator.clipboard.writeText(url); toast('Post link copied.'); } catch { toast(url); } }
+  function toggleSurfFeedCommentForm(card, postId) { const form = card.querySelector('.surf-feed-comment-form'), panel = card.querySelector('.surf-feed-comments'); if (!form || !panel) return; const open = !form.classList.contains('open'); form.classList.toggle('open', open); panel.classList.toggle('open', open); if (open) { expandedSurfFeedComments.add(postId); form.querySelector('input')?.focus(); } else expandedSurfFeedComments.delete(postId); }
+  async function shareSurfFeedPost(postId) { const url = location.origin + location.pathname + '#surf-feed-' + postId; try { if (navigator.share) { await navigator.share({ title: 'Surf post', url }); return; } await navigator.clipboard.writeText(url); toast('Post link copied.'); } catch (error) { if (error?.name === 'AbortError') return; try { await navigator.clipboard.writeText(url); toast('Post link copied.'); } catch { prompt('Copy this post link:', url); } } }
   function onSurfFeedMediaChange(event) {
     const file = event.target.files?.[0]; surfFeedDraftFile = file || null;
     const name = document.getElementById('surfFeedMediaName'), preview = document.getElementById('surfFeedComposerPreview');
@@ -1964,6 +2000,7 @@
       else { pageFollowState = { personId: person?.id || null, iFollow: false, followsMe: false, busy: false }; if (followButton) followButton.style.display = 'none'; }
       // Only the owner of the currently viewed profile can add/manage highlights.
       if (addHighlightButton) addHighlightButton.style.display = isOwnProfile ? 'grid' : 'none';
+      syncPageProfileMoreMenu(person);
       if (person?.id) loadProfilePosts(person.id);
       if (person?.id && person.id !== window.surfCurrentUserId) loadProfileCounts(person.id);
       const pageAvatar = document.getElementById('pageAvatar');
@@ -1999,6 +2036,7 @@
       if (editBioButton) editBioButton.style.display = 'inline-flex';
       if (followButton) followButton.style.display = 'none';
       if (addHighlightButton) addHighlightButton.style.display = 'grid';
+      syncPageProfileMoreMenu(selfProfile);
       document.documentElement.style.removeProperty('--profile-banner');
       document.documentElement.style.removeProperty('--banner-size');
       document.documentElement.style.removeProperty('--banner-position');
@@ -2049,6 +2087,95 @@
       if (values[index]) values[index].textContent = String(count ?? 0);
     });
   }
+
+  async function syncPageProfileMoreMenu(person) {
+    const wrap = document.getElementById('pageProfileMoreMenu');
+    const button = document.getElementById('pageProfileMoreButton');
+    const relationButton = document.getElementById('pageProfileRelationAction');
+    if (!wrap || !button) return;
+    const ownerId = person?.id || currentProfileOwnerId;
+    const isOwn = !ownerId || ownerId === window.surfCurrentUserId;
+    button.style.display = isOwn ? 'none' : 'grid';
+    wrap.style.display = 'none';
+    if (isOwn) return;
+    const muted = surfMutedProfileIds.has(ownerId);
+    const muteButton = document.getElementById('pageProfileMuteAction');
+    if (muteButton) muteButton.textContent = muted ? 'Unmute' : 'Mute';
+    button.dataset.ownerId = ownerId;
+    const [outgoing, incoming, blocked] = await Promise.all([
+      db.from('surf_follows').select('follower_id').eq('follower_id', window.surfCurrentUserId).eq('followed_id', ownerId).maybeSingle(),
+      db.from('surf_follows').select('follower_id').eq('follower_id', ownerId).eq('followed_id', window.surfCurrentUserId).maybeSingle(),
+      db.from('blocks').select('blocker_id').eq('blocker_id', window.surfCurrentUserId).eq('blocked_id', ownerId).maybeSingle()
+    ]);
+    if (button.dataset.ownerId !== ownerId) return;
+    const blockButton = document.getElementById('pageProfileBlockAction');
+    if (blockButton) blockButton.textContent = blocked.data ? 'Unblock' : 'Block';
+    if (relationButton) {
+      if (outgoing.data) {
+        relationButton.style.display = 'block';
+        relationButton.textContent = incoming.data ? 'Unfriend' : 'Unfollow';
+        relationButton.dataset.relation = incoming.data ? 'friends' : 'following';
+      } else {
+        relationButton.style.display = 'none';
+        relationButton.dataset.relation = '';
+      }
+    }
+  }
+  window.togglePageProfileMore = async function(event) {
+    event?.stopPropagation();
+    const menu = document.getElementById('pageProfileMoreMenu');
+    if (!menu) return;
+    if (menu.style.display === 'block') { menu.style.display = 'none'; return; }
+    const person = activeProfile?.id === currentProfileOwnerId ? activeProfile : (selfProfile?.id === currentProfileOwnerId ? selfProfile : { id: currentProfileOwnerId });
+    await syncPageProfileMoreMenu(person);
+    if (currentProfileOwnerId && currentProfileOwnerId !== window.surfCurrentUserId) menu.style.display = 'block';
+  };
+  window.runPageProfileAction = async function(action) {
+    const targetId = currentProfileOwnerId || activeProfile?.id;
+    if (!targetId || targetId === window.surfCurrentUserId) return;
+    const person = activeProfile?.id === targetId ? activeProfile : { id: targetId, username: document.getElementById('pageHandle')?.textContent || 'this user', display_name: document.getElementById('pageName')?.textContent || 'this user' };
+    const label = person.display_name || person.username || 'this user';
+    const menu = document.getElementById('pageProfileMoreMenu'); if (menu) menu.style.display = 'none';
+    if (action === 'mute') {
+      if (surfMutedProfileIds.has(targetId)) { surfMutedProfileIds.delete(targetId); toast('Unmuted ' + label); }
+      else { surfMutedProfileIds.add(targetId); toast('Muted ' + label); }
+      localStorage.setItem('surfMutedProfileIds', JSON.stringify([...surfMutedProfileIds]));
+      syncPageProfileMoreMenu(person); return;
+    }
+    if (action === 'block') {
+      const { data: existing, error: checkError } = await db.from('blocks').select('blocker_id').eq('blocker_id', window.surfCurrentUserId).eq('blocked_id', targetId).maybeSingle();
+      if (checkError) return safeError(checkError, 'Could not check block status.');
+      if (existing) {
+        const { error } = await db.from('blocks').delete().eq('blocker_id', window.surfCurrentUserId).eq('blocked_id', targetId);
+        if (error) return safeError(error, 'Could not unblock this user.');
+        toast('Unblocked ' + label);
+      } else {
+        if (!confirm('Block ' + label + '? They may no longer be able to interact with you.')) return;
+        const { error } = await db.from('blocks').insert({ blocker_id: window.surfCurrentUserId, blocked_id: targetId });
+        if (error) return safeError(error, 'Could not block this user.');
+        toast('Blocked ' + label);
+      }
+      await loadLiveSurfWorkspace(); syncPageProfileMoreMenu(person); return;
+    }
+    if (action === 'relationship') {
+      const [outgoing, incoming] = await Promise.all([
+        db.from('surf_follows').select('follower_id').eq('follower_id', window.surfCurrentUserId).eq('followed_id', targetId).maybeSingle(),
+        db.from('surf_follows').select('follower_id').eq('follower_id', targetId).eq('followed_id', window.surfCurrentUserId).maybeSingle()
+      ]);
+      if (outgoing.error || incoming.error) return safeError(outgoing.error || incoming.error, 'Could not load follow status.');
+      if (!outgoing.data) return syncPageProfileMoreMenu(person);
+      const mutual = !!incoming.data;
+      if (!confirm(mutual ? `Are you sure you want to unfriend ${label}? You will both stop following each other.` : `Are you sure you want to unfollow ${label}?`)) return;
+      const first = await db.from('surf_follows').delete().eq('follower_id', window.surfCurrentUserId).eq('followed_id', targetId);
+      if (first.error) return safeError(first.error, 'Could not update this relationship.');
+      if (mutual) {
+        const second = await db.from('surf_follows').delete().eq('follower_id', targetId).eq('followed_id', window.surfCurrentUserId);
+        if (second.error) return safeError(second.error, 'Your follow was removed, but the other side could not be removed. Please retry.');
+      }
+      await refreshPageFollowState(person); await loadProfileCounts(targetId); await updateOwnCounts(); await syncPageProfileMoreMenu(person);
+      toast(mutual ? 'You are no longer friends.' : 'Unfollowed ' + label + '.');
+    }
+  };
 
   async function refreshPageFollowState(person) {
     const button = document.getElementById('pageFollowButton');
@@ -2144,6 +2271,7 @@
   window.appendMessage = sendLiveMessage;
   window.openProfile = openProfileForCurrentChat;
   window.openDiscoverProfile = openLiveProfile;
+  window.openDiscoverFromCommunity = openDiscoverFromCommunity;
   window.renderDiscoverResults = renderDiscoverResults;
   window.toggleDiscoverFollow = toggleLiveFriendRequest;
   window.toggleCurrentRelationship = toggleLiveFriendRequest;
@@ -2159,6 +2287,7 @@
   window.openStoryArchive = openStoryArchive;
   window.openSavedPosts = openSavedPosts;
   window.openSurfFeed = openSurfFeed;
+  window.focusSurfFeedComposer = focusSurfFeedComposer;
   window.closeSurfFeed = closeSurfFeed;
   window.setSurfFeedTab = setSurfFeedTab;
   window.publishSurfFeedPost = publishSurfFeedPost;
