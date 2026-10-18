@@ -2255,11 +2255,23 @@
         const profile = await window.loadSurfProfile(authUser);
         window.enterApp(profile);
       } catch (error) {
+        // A profile-row/network error must not turn a valid Supabase session
+        // into an apparent sign-out. Keep the authenticated user in the app
+        // with safe metadata fallbacks and report the profile issue separately.
         console.error('Surf profile restore failed:', error);
-        restoringUserId = null;
+        const meta = authUser.user_metadata || {};
+        const fallbackName = meta.display_name || meta.username || (authUser.email || 'Surf member').split('@')[0];
+        window.surfCurrentUserId = authUser.id;
+        window.enterApp({
+          id: authUser.id,
+          username: fallbackName,
+          handle: meta.username || fallbackName.toLowerCase().replace(/[^a-z0-9._]/g, ''),
+          bio: '', avatar_path: null, banner_path: null,
+          dob: meta.date_of_birth || '', social_links: {}, email: authUser.email || ''
+        });
         const errorBox = document.getElementById('authError');
-        if (errorBox) errorBox.textContent = 'Your session is saved, but your profile could not load. Please retry in a moment.';
-        showAuthPage('login');
+        if (errorBox) errorBox.textContent = 'You are still signed in, but your profile could not load. Check your connection and profile permissions.';
+        toast('Signed in, but profile details could not load.');
       }
     };
     db.auth.onAuthStateChange((event, session) => {
@@ -2449,8 +2461,10 @@
   bindProfileImageUploads();
   restoreSupabaseSession().catch((error) => {
     console.error('Could not restore Surf session:', error);
-    document.getElementById('authError').textContent = error?.message || 'Could not restore your account. Please log in again.';
-    showAuthPage('login');
+    const errorBox = document.getElementById('authError');
+    if (errorBox) errorBox.textContent = 'Could not check your saved session. Your stored login was not deliberately cleared; check your connection and refresh once more.';
+    // Do not call signOut or overwrite storage here. The normal auth screen
+    // remains available if there is genuinely no session to restore.
   });
   window.setMyPresence = setLivePresence;
 })();
