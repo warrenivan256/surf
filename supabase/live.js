@@ -240,6 +240,13 @@
     try { messages = await latestMessages(); } catch (error) { safeError(error, 'Could not load conversations.'); }
     const friendIds = new Set(requests.filter((item) => item.status === 'accepted').map((item) => item.requester_id === window.surfCurrentUserId ? item.addressee_id : item.requester_id));
     const people = friends.filter((person) => friendIds.has(person.id));
+    const newestByPerson = new Map();
+    for (const message of messages) {
+      const otherId = message.sender_id === window.surfCurrentUserId ? message.recipient_id : message.sender_id;
+      const time = Date.parse(message.created_at || 0);
+      if (!newestByPerson.has(otherId) || time > newestByPerson.get(otherId)) newestByPerson.set(otherId, time);
+    }
+    people.sort((a, b) => (newestByPerson.get(b.id) || 0) - (newestByPerson.get(a.id) || 0));
     people.forEach((person) => {
       const row = document.createElement('div');
       row.className = 'person';
@@ -262,7 +269,7 @@
       const copy = document.createElement('div'); copy.className = 'person-info';
       const name = document.createElement('div'); name.className = 'person-name'; name.textContent = group.name;
       const preview = document.createElement('div'); preview.className = 'preview'; preview.textContent = 'Group conversation';
-      copy.append(name, preview); row.append(icon, copy); row.onclick = () => selectLiveGroup(row, group); list.append(row);
+      copy.append(name, preview); row.append(icon, copy); row.onclick = () => selectLiveGroup(row, group); row.ondblclick = (event) => { event.preventDefault(); openGroupDetails(group); }; row.title = 'Double-click to view group details'; list.append(row);
     });
     if (!people.length && !groups.length) setEmpty(list, 'No conversations yet. Use Discover to find people and send a friend request.');
   }
@@ -305,7 +312,7 @@
     if (message.media_path) { const img = document.createElement('img'); img.alt = 'Shared photo'; img.style.cssText = 'width:245px;max-width:100%;max-height:300px;object-fit:cover;border-radius:12px;display:block'; db.storage.from('surf-chat-media').createSignedUrl(message.media_path, 3600).then(({data}) => { if (data?.signedUrl) img.src = data.signedUrl; }); bubble.append(img); if (message.body) { const caption = document.createElement('div'); caption.className = 'photo-caption'; caption.textContent = message.body; bubble.append(caption); } } else bubble.textContent = message.body;
     const stamp = document.createElement('div'); stamp.className = 'stamp';
     const sentTime = new Date(message.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    stamp.textContent = mine ? `${sentTime} · ${message.read_at && localReadReceiptsEnabled() && person?.read_receipts_enabled !== false ? 'Read' : message.delivered_at ? 'Delivered' : 'Sent'}` : sentTime;
+    stamp.textContent = mine ? `${sentTime} · ${message.read_at ? 'Read' : message.delivered_at ? 'Delivered' : 'Sent'}` : sentTime;
     wrap.append(bubble, stamp); row.append(wrap); list.append(row); list.scrollTop = list.scrollHeight;
   }
 
@@ -332,6 +339,8 @@
     row.classList.add('selected');
     window.surfActiveRecipientId = person.id; window.surfActiveGroupId = null;
     document.getElementById('chatName').textContent = person.display_name || person.username;
+    document.getElementById('chatName').title = 'Open profile'; document.getElementById('chatName').style.cursor = 'pointer'; document.getElementById('chatName').onclick = openProfileForCurrentChat;
+    document.getElementById('chatAvatar').title = 'Open profile'; document.getElementById('chatAvatar').style.cursor = 'pointer'; document.getElementById('chatAvatar').onclick = openProfileForCurrentChat;
     const avatar = document.getElementById('chatAvatar');
     const avatarUrl = profileAssetUrl(person.avatar_path);
     avatar.textContent = avatarUrl ? '' : initials(person);
@@ -1058,6 +1067,9 @@
       if (signed?.signedUrl && post.media_type === 'video') { const video = document.createElement('video'); video.src = signed.signedUrl; video.controls = true; card.append(video); }
       else if (signed?.signedUrl) { const image = document.createElement('img'); image.src = signed.signedUrl; image.alt = post.caption || 'Surf post'; card.append(image); }
       const caption = document.createElement('p'); caption.textContent = post.caption; card.append(caption);
+      card.tabIndex = 0; card.setAttribute('role','button'); card.setAttribute('aria-label','Open post');
+      card.onclick = (event) => { if (event.target.closest('button,video')) return; openPostDetail(post, signed?.signedUrl); };
+      if (ownerId === window.surfCurrentUserId) { const del = document.createElement('button'); del.type='button'; del.className='delete-post-button'; del.textContent='Delete'; del.onclick=(event)=>{event.stopPropagation();deleteOwnPost(post);}; card.append(del); }
       const save = document.createElement('button'); save.type = 'button'; save.className = 'save-post-button'; save.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4.5h12v16l-6-4-6 4z"/></svg><span>Save</span>'; save.setAttribute('aria-label', 'Save post'); save.onclick = () => toggleSavedPost(post.id, save); card.append(save); target.append(card);
     }
     if (!visiblePosts.length) setEmpty(target, view === 'videos' ? 'No videos yet.' : view === 'tagged' ? 'No tagged posts yet.' : 'No posts yet.');
@@ -1072,6 +1084,50 @@
     if (result.error) return safeError(result.error, 'Could not update saved posts.');
     button.classList.toggle('saved', !data);
     button.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4.5h12v16l-6-4-6 4z"/></svg><span>${data ? 'Save' : 'Saved'}</span>`;
+  }
+
+  async function deleteOwnPost(post) {
+    if (!post || post.owner_id !== window.surfCurrentUserId || !confirm('Delete this post permanently?')) return;
+    const { error } = await db.from('posts').delete().eq('id', post.id).eq('owner_id', window.surfCurrentUserId);
+    if (error) return safeError(error, 'Could not delete this post. Check the post deletion policy.');
+    if (post.media_path) await db.storage.from('surf-post-media').remove([post.media_path]);
+    await loadProfilePosts(window.surfCurrentUserId); await updateOwnCounts(); toast('Post deleted.');
+  }
+  async function openPostDetail(post, mediaUrl) {
+    let modal = document.getElementById('postDetailModal');
+    if (!modal) {
+      modal = document.createElement('div'); modal.id='postDetailModal'; modal.className='modal-back';
+      modal.innerHTML='<section class="modal post-detail-modal"><button class="close" type="button" data-close>×</button><div class="post-detail-layout"><div class="post-detail-media"></div><aside><h2>Post</h2><p class="post-detail-caption"></p><div class="post-detail-actions"><button type="button" data-like>♡ Like <span>0</span></button><button type="button" data-focus-comment>Comment</button><button type="button" data-save>Save</button></div><div class="post-comments"></div><form class="post-comment-form"><input maxlength="1000" placeholder="Write a comment…" required><button class="btn primary">Send</button></form></aside></div></section>';
+      document.body.append(modal); modal.addEventListener('click',e=>{if(e.target===modal||e.target.closest('[data-close]'))modal.style.display='none';});
+    }
+    modal.querySelector('.post-detail-media').replaceChildren();
+    if (mediaUrl) { const media = post.media_type==='video' ? document.createElement('video') : document.createElement('img'); media.src=mediaUrl; if(media.tagName==='VIDEO')media.controls=true; media.alt='Post media'; modal.querySelector('.post-detail-media').append(media); }
+    modal.querySelector('.post-detail-caption').textContent=post.caption||'';
+    const likeBtn=modal.querySelector('[data-like]'), commentsBox=modal.querySelector('.post-comments'), form=modal.querySelector('.post-comment-form');
+    async function refreshPostSocial(){
+      const [{count:likes},{data:mine},{data:comments,error}] = await Promise.all([
+        db.from('post_likes').select('post_id',{count:'exact',head:true}).eq('post_id',post.id),
+        db.from('post_likes').select('post_id').eq('post_id',post.id).eq('user_id',window.surfCurrentUserId).maybeSingle(),
+        db.from('post_comments').select('id,user_id,body,created_at').eq('post_id',post.id).order('created_at')
+      ]);
+      if(error) { commentsBox.textContent='Comments unavailable. Apply the post-interactions SQL migration.'; return; }
+      likeBtn.innerHTML=(mine?'♥':'♡')+' Like <span>'+(likes||0)+'</span>'; likeBtn.dataset.liked=mine?'1':'0'; commentsBox.replaceChildren();
+      const ids=[...new Set((comments||[]).map(c=>c.user_id))]; let profiles=[]; if(ids.length){const r=await db.from('profiles').select('id,username,display_name').in('id',ids);profiles=r.data||[];}
+      (comments||[]).forEach(c=>{const p=profiles.find(x=>x.id===c.user_id);const row=document.createElement('p');const b=document.createElement('b');b.textContent=(p?.display_name||p?.username||'User')+': ';row.append(b,document.createTextNode(c.body));commentsBox.append(row);});
+    }
+    likeBtn.onclick=async()=>{const liked=likeBtn.dataset.liked==='1';const result=liked?await db.from('post_likes').delete().eq('post_id',post.id).eq('user_id',window.surfCurrentUserId):await db.from('post_likes').insert({post_id:post.id,user_id:window.surfCurrentUserId});if(result.error)return safeError(result.error,'Could not update like. Apply post-interactions SQL migration.');await refreshPostSocial();};
+    modal.querySelector('[data-focus-comment]').onclick=()=>form.querySelector('input').focus();
+    modal.querySelector('[data-save]').onclick=async()=>{const r=await db.from('saved_posts').select('post_id').eq('post_id',post.id).eq('user_id',window.surfCurrentUserId).maybeSingle();if(r.error)return safeError(r.error,'Could not check saved post.');const x=r.data?await db.from('saved_posts').delete().eq('post_id',post.id).eq('user_id',window.surfCurrentUserId):await db.from('saved_posts').insert({post_id:post.id,user_id:window.surfCurrentUserId});if(x.error)return safeError(x.error,'Could not save post.');toast(r.data?'Post unsaved':'Post saved');};
+    form.onsubmit=async e=>{e.preventDefault();const input=form.querySelector('input'),body=input.value.trim();if(!body)return;const r=await db.from('post_comments').insert({post_id:post.id,user_id:window.surfCurrentUserId,body});if(r.error)return safeError(r.error,'Could not post comment. Apply post-interactions SQL migration.');input.value='';await refreshPostSocial();};
+    await refreshPostSocial(); modal.style.display='grid';
+  }
+  async function openFollowList(kind, ownerId = window.surfCurrentUserId) {
+    const column=kind==='followers'?'follower_id':'followed_id';
+    const {data,error}=await db.from('surf_follows').select('follower_id,followed_id').eq(kind==='followers'?'followed_id':'follower_id',ownerId);
+    if(error)return safeError(error,'Could not load '+kind+'.');
+    const ids=(data||[]).map(row=>kind==='followers'?row.follower_id:row.followed_id); if(!ids.length){toast('No '+kind+' yet.');return;}
+    const result=await db.from('profiles').select('username,display_name').in('id',ids);if(result.error)return safeError(result.error,'Could not load profiles.');
+    const names=(result.data||[]).map(p=>p.display_name||p.username); alert((kind==='followers'?'Followers':'Following')+'\n\n'+names.join('\n'));
   }
 
   async function openSavedPosts() {
@@ -1223,6 +1279,7 @@
     cardBanner.style.backgroundImage = person.banner_path ? `url("${profileAssetUrl(person.banner_path)}")` : '';
     cardBanner.style.backgroundSize = 'cover'; cardBanner.style.backgroundPosition = 'center';
     document.getElementById('profileCardPosts').textContent = '0'; document.getElementById('profileCardFollowers').textContent = '0'; document.getElementById('profileCardFollowing').textContent = '0';
+    document.getElementById('profileCardFollowers').parentElement.style.cursor='pointer'; document.getElementById('profileCardFollowers').parentElement.onclick=()=>openFollowList('followers',person.id); document.getElementById('profileCardFollowing').parentElement.style.cursor='pointer'; document.getElementById('profileCardFollowing').parentElement.onclick=()=>openFollowList('following',person.id);
     const rel = person.relation;
     document.getElementById('blockPersonButton').textContent = 'Block'; document.getElementById('mutePersonButton').textContent = 'Mute';
     document.getElementById('relationshipPersonButton').textContent = rel.requester_id === window.surfCurrentUserId ? 'Unfriend' : 'Unfriend';
