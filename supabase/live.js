@@ -680,10 +680,25 @@
     document.getElementById('discoverBio').textContent = person.bio || 'No bio yet.';
     const discoverAge = document.getElementById('discoverAgeBadge'); if (discoverAge) { discoverAge.textContent = person.is_minor ? '🧒 Minor' : '18+'; discoverAge.style.display = 'inline-flex'; }
     renderSocialLinks(document.getElementById('discoverSocialLinks'), person.social_links);
-    const [postsCount, followersCount, followingCount] = await Promise.all([db.from('posts').select('id', { count: 'exact', head: true }).eq('owner_id', person.id), db.from('surf_follows').select('follower_id', { count: 'exact', head: true }).eq('followed_id', person.id), db.from('surf_follows').select('followed_id', { count: 'exact', head: true }).eq('follower_id', person.id)]);
-    document.getElementById('discoverPosts').textContent = String(postsCount.count ?? 0);
-    document.getElementById('discoverFollowers').textContent = String(followersCount.count ?? 0);
-    document.getElementById('discoverFollowing').textContent = String(followingCount.count ?? 0);
+    const discoverCountNodes = ['discoverPosts', 'discoverFollowers', 'discoverFollowing'].map((id) => document.getElementById(id));
+    discoverCountNodes.forEach((node) => { if (node) node.textContent = '…'; });
+    const [postsCount, followersCount, followingCount] = await Promise.all([
+      db.from('posts').select('id', { count: 'exact', head: true }).eq('owner_id', person.id),
+      db.from('surf_follows').select('follower_id', { count: 'exact', head: true }).eq('followed_id', person.id),
+      db.from('surf_follows').select('followed_id', { count: 'exact', head: true }).eq('follower_id', person.id)
+    ]);
+    // Do not let a slower request for a previous profile overwrite the currently opened profile.
+    if (activeProfile?.id === person.id) {
+      const errors = [postsCount.error, followersCount.error, followingCount.error].filter(Boolean);
+      if (errors.length) {
+        errors.forEach((error) => console.error('Profile count query failed:', error));
+        discoverCountNodes.forEach((node) => { if (node) node.textContent = '—'; });
+      } else {
+        [postsCount.count, followersCount.count, followingCount.count].forEach((count, index) => {
+          if (discoverCountNodes[index]) discoverCountNodes[index].textContent = String(count ?? 0);
+        });
+      }
+    }
     const state = await requestStatus(person.id);
     document.getElementById('discoverFollowButton').textContent = ({ sent: 'Requested', received: 'Accept request', accepted: 'Unfriend' }[state] || 'Add friend');
     document.getElementById('discoverBlockLabel').textContent = 'Block';
@@ -1383,6 +1398,23 @@
     });
   }
 
+  async function loadProfileCardCounts(ownerId) {
+    const nodes = ['profileCardPosts', 'profileCardFollowers', 'profileCardFollowing'].map((id) => document.getElementById(id));
+    const [posts, followers, following] = await Promise.all([
+      db.from('posts').select('id', { count: 'exact', head: true }).eq('owner_id', ownerId),
+      db.from('surf_follows').select('follower_id', { count: 'exact', head: true }).eq('followed_id', ownerId),
+      db.from('surf_follows').select('followed_id', { count: 'exact', head: true }).eq('follower_id', ownerId)
+    ]);
+    if (activeProfile?.id !== ownerId) return;
+    const errors = [posts.error, followers.error, following.error].filter(Boolean);
+    if (errors.length) {
+      errors.forEach((error) => console.error('Chat profile count query failed:', error));
+      nodes.forEach((node) => { if (node) node.textContent = '—'; });
+      return;
+    }
+    [posts.count, followers.count, following.count].forEach((count, index) => { if (nodes[index]) nodes[index].textContent = String(count ?? 0); });
+  }
+
   async function openProfileForCurrentChat() {
     const id = window.surfActiveRecipientId; const person = friends.find((item) => item.id === id);
     if (!person) return;
@@ -1400,7 +1432,8 @@
     const cardBanner = document.getElementById('profileCardBanner');
     cardBanner.style.backgroundImage = person.banner_path ? `url("${profileAssetUrl(person.banner_path)}")` : '';
     cardBanner.style.backgroundSize = 'cover'; cardBanner.style.backgroundPosition = 'center';
-    document.getElementById('profileCardPosts').textContent = '0'; document.getElementById('profileCardFollowers').textContent = '0'; document.getElementById('profileCardFollowing').textContent = '0';
+    document.getElementById('profileCardPosts').textContent = '…'; document.getElementById('profileCardFollowers').textContent = '…'; document.getElementById('profileCardFollowing').textContent = '…';
+    loadProfileCardCounts(person.id);
     document.getElementById('profileCardFollowers').parentElement.style.cursor='pointer'; document.getElementById('profileCardFollowers').parentElement.onclick=()=>openFollowList('followers',person.id); document.getElementById('profileCardFollowing').parentElement.style.cursor='pointer'; document.getElementById('profileCardFollowing').parentElement.onclick=()=>openFollowList('following',person.id);
     const rel = person.relation;
     document.getElementById('blockPersonButton').textContent = 'Block'; document.getElementById('mutePersonButton').textContent = 'Mute';
@@ -1416,12 +1449,18 @@
       db.from('surf_follows').select('follower_id', { count: 'exact', head: true }).eq('followed_id', id),
       db.from('surf_follows').select('followed_id', { count: 'exact', head: true }).eq('follower_id', id)
     ]);
-    if (postCount.error || followersCount.error || followingCount.error) return;
-    const counts = [postCount.count || 0, followersCount.count || 0, followingCount.count || 0];
-    const values = document.querySelectorAll('.stats b');
-    values.forEach((item, index) => { if (counts[index] !== undefined) item.textContent = String(counts[index]); });
-    const profileValues = document.querySelectorAll('#profilePage .profile-stats b');
-    profileValues.forEach((item, index) => { if (counts[index] !== undefined) item.textContent = String(counts[index]); });
+    const errors = [postCount.error, followersCount.error, followingCount.error].filter(Boolean);
+    if (errors.length) { errors.forEach((error) => console.error('Own profile count query failed:', error)); return; }
+    const counts = [postCount.count ?? 0, followersCount.count ?? 0, followingCount.count ?? 0];
+    // Only update the side-profile stats (the signed-in user's own profile).
+    const ownStats = document.querySelectorAll('.right .stats b');
+    ownStats.forEach((item, index) => { if (counts[index] !== undefined) item.textContent = String(counts[index]); });
+    // Never overwrite another person's full-profile counts with the current user's counts.
+    const profilePage = document.getElementById('profilePage');
+    if (profilePage?.dataset.ownerId === id) {
+      const profileValues = profilePage.querySelectorAll('.profile-stats b');
+      profileValues.forEach((item, index) => { if (counts[index] !== undefined) item.textContent = String(counts[index]); });
+    }
   }
 
   let currentProfileOwnerId = null;
@@ -1818,21 +1857,26 @@
   }
 
   async function loadProfileCounts(ownerId) {
+    const page = document.getElementById('profilePage');
+    if (!page || !ownerId) return;
+    const values = page.querySelectorAll('.profile-stats b');
+    values.forEach((node) => { node.textContent = '…'; });
     const [postCount, followersCount, followingCount] = await Promise.all([
       db.from('posts').select('id', { count: 'exact', head: true }).eq('owner_id', ownerId),
       db.from('surf_follows').select('follower_id', { count: 'exact', head: true }).eq('followed_id', ownerId),
       db.from('surf_follows').select('followed_id', { count: 'exact', head: true }).eq('follower_id', ownerId)
     ]);
-    if (postCount.error || followersCount.error || followingCount.error) {
-      if (postCount.error) console.error(postCount.error);
-      if (followersCount.error) console.error(followersCount.error);
-      if (followingCount.error) console.error(followingCount.error);
+    // The user may have opened another profile while the count requests were in flight.
+    if (page.dataset.ownerId !== ownerId) return;
+    const errors = [postCount.error, followersCount.error, followingCount.error].filter(Boolean);
+    if (errors.length) {
+      errors.forEach((error) => console.error('Profile count query failed:', error));
+      values.forEach((node) => { node.textContent = '—'; });
       return;
     }
-    const values = document.querySelectorAll('#profilePage .profile-stats b');
-    if (values[0]) values[0].textContent = String(postCount.count || 0);
-    if (values[1]) values[1].textContent = String(followersCount.count || 0);
-    if (values[2]) values[2].textContent = String(followingCount.count || 0);
+    [postCount.count, followersCount.count, followingCount.count].forEach((count, index) => {
+      if (values[index]) values[index].textContent = String(count ?? 0);
+    });
   }
 
   async function refreshPageFollowState(person) {
