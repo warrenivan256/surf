@@ -1438,15 +1438,20 @@
     const { data: saved, error } = await db.from('profiles').update({ display_name: displayName || username, username, bio, updated_at: new Date().toISOString() }).eq('id', window.surfCurrentUserId).select('id').maybeSingle();
     if (error) return safeError(error, 'Could not save your profile.');
     if (!saved) return toast('Your profile could not be found. Sign out and sign back in, then try again.');
-    document.querySelectorAll('.profile-name').forEach((el) => { el.textContent = displayName || username; });
-    document.querySelectorAll('.profile-handle').forEach((el) => { el.textContent = '@' + username; });
-    document.querySelectorAll('.bio').forEach((el) => { el.textContent = bio; });
+    const ownSideName = document.querySelector('.right .profile-name');
+    const ownSideHandle = document.querySelector('.right .profile-handle');
+    const ownSideBio = document.querySelector('.right .bio');
+    if (ownSideName) ownSideName.textContent = displayName || username;
+    if (ownSideHandle) ownSideHandle.textContent = '@' + username;
+    if (ownSideBio) ownSideBio.textContent = bio;
     document.getElementById('myProfileMenuName').textContent = displayName || username;
     document.getElementById('myProfileMenuHandle').textContent = '@' + username;
     selfProfile = { ...selfProfile, username: displayName || username, handle: username, bio };
-    document.getElementById('pageName').textContent = selfProfile.username;
-    document.getElementById('pageHandle').textContent = username;
-    document.getElementById('pageBio').textContent = bio;
+    if (currentProfileOwnerId === window.surfCurrentUserId) {
+      document.getElementById('pageName').textContent = selfProfile.username;
+      document.getElementById('pageHandle').textContent = username;
+      document.getElementById('pageBio').textContent = bio;
+    }
     toast('Profile saved.');
   }
 
@@ -1731,6 +1736,16 @@
       originalShowProfilePage();
       const person = activeProfile || selfProfile;
       currentProfileOwnerId = person?.id || null;
+      const profilePage = document.getElementById('profilePage');
+      if (profilePage) profilePage.dataset.ownerId = person?.id || '';
+      document.getElementById('pageName').textContent = person?.display_name || person?.username || 'Profile';
+      document.getElementById('pageHandle').textContent = person?.username || '';
+      document.getElementById('pageBio').textContent = person?.bio || 'No bio yet.';
+      const isOwnProfile = !!person?.id && person.id === window.surfCurrentUserId;
+      const editBioButton = document.getElementById('editOwnBioButton');
+      const followButton = document.getElementById('pageFollowButton');
+      if (editBioButton) editBioButton.style.display = isOwnProfile ? 'inline-flex' : 'none';
+      if (followButton) followButton.style.display = isOwnProfile ? 'none' : 'inline-flex';
       if (person?.id) loadProfilePosts(person.id);
       if (person?.id && person.id !== window.surfCurrentUserId) loadProfileCounts(person.id);
       const pageAvatar = document.getElementById('pageAvatar');
@@ -1758,6 +1773,12 @@
     window.showMyProfile = function() {
       if (!selfProfile) return;
       currentProfileOwnerId = selfProfile.id;
+      const profilePage = document.getElementById('profilePage');
+      if (profilePage) profilePage.dataset.ownerId = selfProfile.id;
+      const editBioButton = document.getElementById('editOwnBioButton');
+      const followButton = document.getElementById('pageFollowButton');
+      if (editBioButton) editBioButton.style.display = 'inline-flex';
+      if (followButton) followButton.style.display = 'none';
       document.documentElement.style.removeProperty('--profile-banner');
       document.documentElement.style.removeProperty('--banner-size');
       document.documentElement.style.removeProperty('--banner-position');
