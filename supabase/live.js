@@ -1240,14 +1240,21 @@
       const postLikes = likes.filter((row) => row.post_id === post.id).length;
       const postReposts = reposts.filter((row) => row.post_id === post.id).length;
       const postComments = comments.filter((row) => row.post_id === post.id).length;
-      const makeAction = (kind, symbol, count, active, label) => {
+      const feedActionIcons = {
+        comment: '<svg class="surf-feed-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.2 11.4a7.8 7.8 0 0 1-8.1 7.5 8.7 8.7 0 0 1-3.4-.7L4 20l1.2-4.1A7.1 7.1 0 0 1 3.8 11c0-4.2 3.6-7.4 8.3-7.4s8.1 3.2 8.1 7.8Z"/></svg>',
+        repost: '<svg class="surf-feed-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m17 3 4 4-4 4"/><path d="M3 11V9a2 2 0 0 1 2-2h16"/><path d="m7 21-4-4 4-4"/><path d="M21 13v2a2 2 0 0 1-2 2H3"/></svg>',
+        like: '<svg class="surf-feed-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.8 8.8c0 5.1-8.8 10.1-8.8 10.1S3.2 13.9 3.2 8.8A4.7 4.7 0 0 1 12 6.2a4.7 4.7 0 0 1 8.8 2.6Z"/></svg>',
+        save: '<svg class="surf-feed-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4.8A1.8 1.8 0 0 1 7.8 3h8.4A1.8 1.8 0 0 1 18 4.8V21l-6-4-6 4Z"/></svg>',
+        share: '<svg class="surf-feed-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6"/><path d="M20 4 10.5 13.5"/><path d="M18 13v5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h5"/></svg>'
+      };
+      const makeAction = (kind, count, active, label) => {
         const button = document.createElement('button'); button.type = 'button'; button.className = 'surf-feed-action' + (active ? ' ' + active : ''); button.setAttribute('aria-label', label); button.title = label;
-        const icon = document.createElement('span'); icon.textContent = symbol; icon.style.fontSize = '19px';
-        const number = document.createElement('span'); number.textContent = count == null ? '' : String(count); button.append(icon, number);
+        button.innerHTML = feedActionIcons[kind] || '';
+        if (count != null) { const number = document.createElement('span'); number.textContent = String(count); number.className = 'surf-feed-action-count'; button.append(number); }
         button.onclick = (event) => { event.stopPropagation(); if (kind === 'like') toggleSurfFeedLike(post.id, button); else if (kind === 'repost') toggleSurfFeedRepost(post.id, button); else if (kind === 'comment') toggleSurfFeedCommentForm(card, post.id); else if (kind === 'save') toggleSurfFeedSave(post.id, button); else if (kind === 'share') shareSurfFeedPost(post.id); };
         return button;
       };
-      actionBar.append(makeAction('comment', '♧', postComments, '', 'Reply'), makeAction('repost', '↻', postReposts, reposted.has(post.id) ? 'reposted' : '', 'Repost'), makeAction('like', liked.has(post.id) ? '♥' : '♡', postLikes, liked.has(post.id) ? 'liked' : '', 'Like'), makeAction('save', saved.has(post.id) ? '▣' : '▢', null, saved.has(post.id) ? 'saved' : '', 'Save'), makeAction('share', '↗', null, '', 'Share'));
+      actionBar.append(makeAction('comment', postComments, '', 'Reply'), makeAction('repost', postReposts, reposted.has(post.id) ? 'reposted' : '', 'Repost'), makeAction('like', postLikes, liked.has(post.id) ? 'liked' : '', 'Like'), makeAction('save', null, saved.has(post.id) ? 'saved' : '', 'Save'), makeAction('share', null, '', 'Share'));
       main.append(actionBar);
       const form = document.createElement('form'); form.className = 'surf-feed-comment-form'; form.innerHTML = '<input maxlength="1000" placeholder="Write a reply…" aria-label="Write a reply" required><button type="submit">Reply</button>';
       form.onsubmit = async (event) => { event.preventDefault(); const input = form.querySelector('input'); const bodyText = input.value.trim(); if (!bodyText) return; const { error: commentError } = await db.from('surf_feed_comments').insert({ post_id: post.id, user_id: window.surfCurrentUserId, body: bodyText }); if (commentError) return safeError(commentError, 'Could not send reply.'); toast('Reply posted.'); await loadSurfFeed(); };
