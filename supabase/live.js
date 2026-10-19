@@ -1315,7 +1315,7 @@
   }
   async function deleteSurfFeedPost(post) {
     if (!post || post.owner_id !== window.surfCurrentUserId) return toast('You can only delete your own posts.');
-    if (!confirm('Delete this post? Its replies, likes, reposts, and saves will be removed too.')) return;
+    if (!(await (window.surfConfirm ? window.surfConfirm({ title: 'Delete post?', message: 'Its replies, likes, reposts, and saves will be removed too.', confirmText: 'Delete post', danger: true }) : Promise.resolve(window.confirm('Delete this post? Its replies, likes, reposts, and saves will be removed too.'))))) return;
     const { error } = await db.from('surf_feed_posts').delete().eq('id', post.id).eq('owner_id', window.surfCurrentUserId);
     if (error) return safeError(error, 'Could not delete your post.');
     if (post.media_path) { const { error: storageError } = await db.storage.from('surf-feed-media').remove([post.media_path]); if (storageError) console.warn('Post deleted but media cleanup failed:', storageError.message); }
@@ -1554,7 +1554,12 @@
 
   async function shareLiveStory() {
     if (!window.surfCurrentUserId) return toast('Sign in before sharing a story.');
-    const pending = storyDraftMode === 'photo' ? storyDraftFiles : [];
+    let pending = storyDraftMode === 'photo' ? (Array.isArray(storyDraftFiles) ? storyDraftFiles : []) : [];
+    // Recovery path: if the preview/input listener did not populate the draft array, use the actual selected files.
+    if (storyDraftMode === 'photo' && !pending.length) {
+      const inputFiles = [...(document.getElementById('storyInput')?.files || [])].filter(file => file.type.startsWith('image/'));
+      if (inputFiles.length) { storyDraftFiles = inputFiles; pending = inputFiles; }
+    }
     const body = storyDraftMode === 'text' ? document.getElementById('storyTextInput').value.trim() : '';
     if (storyDraftMode === 'photo' && !pending.length) return toast('Choose at least one photo.');
     if (storyDraftMode === 'text' && !body) return toast('Write something for your story first.');
@@ -1963,6 +1968,22 @@
     };
   }
 
+  function syncFullProfileCreatePostButton(isOwnProfile) {
+    const actions = document.getElementById('pageProfileActions');
+    if (!actions) return;
+    let button = document.getElementById('pageCreatePostButton');
+    if (!button) {
+      button = document.createElement('button');
+      button.id = 'pageCreatePostButton';
+      button.type = 'button';
+      button.className = 'btn primary';
+      button.textContent = '+ Create post';
+      button.addEventListener('click', () => window.openPostComposer?.());
+      actions.append(button);
+    }
+    button.style.display = isOwnProfile ? 'inline-flex' : 'none';
+  }
+
   function enterAppWithLiveData() {
     const original = window.enterApp;
     window.enterApp = function(user) {
@@ -1995,6 +2016,7 @@
       const followButton = document.getElementById('pageFollowButton');
       const addHighlightButton = document.querySelector('#profileHighlightRow .profile-highlight-add');
       if (editBioButton) editBioButton.style.display = isOwnProfile ? 'inline-flex' : 'none';
+      syncFullProfileCreatePostButton(isOwnProfile);
       if (followButton) followButton.style.display = isOwnProfile ? 'none' : 'inline-flex';
       if (person?.id && !isOwnProfile) refreshPageFollowState(person);
       else { pageFollowState = { personId: person?.id || null, iFollow: false, followsMe: false, busy: false }; if (followButton) followButton.style.display = 'none'; }
@@ -2034,6 +2056,7 @@
       const followButton = document.getElementById('pageFollowButton');
       const addHighlightButton = document.querySelector('#profileHighlightRow .profile-highlight-add');
       if (editBioButton) editBioButton.style.display = 'inline-flex';
+      syncFullProfileCreatePostButton(true);
       if (followButton) followButton.style.display = 'none';
       if (addHighlightButton) addHighlightButton.style.display = 'grid';
       syncPageProfileMoreMenu(selfProfile);
@@ -2383,18 +2406,48 @@
     window.setFriendsTab('discover', document.querySelector('#friendsModal [data-friend-tab="discover"]'));
     setTimeout(() => document.getElementById('discoverInput')?.focus(), 80);
   };
-  window.openFriendsList = function() {
+  async function refreshFriendsFromDatabase() {
+    const userId = window.surfCurrentUserId;
+    if (!userId) return;
+    const { data: relations, error: relationError } = await db.from('friend_requests')
+      .select('id,requester_id,addressee_id,status,created_at,updated_at')
+      .or(`requester_id.eq.${userId},addressee_id.eq.${userId}`);
+    if (relationError) throw relationError;
+    requests = relations || [];
+    const ids = [...new Set(requests.flatMap(rel => [rel.requester_id, rel.addressee_id]).filter(id => id && id !== userId))];
+    if (!ids.length) { friends = []; await loadFriendsAndRequests(); return; }
+    const { data: profiles, error: profileError } = await db.from('profiles')
+      .select('id,username,display_name,bio,status,created_at,avatar_path,banner_path,is_minor,social_links,read_receipts_enabled')
+      .in('id', ids);
+    if (profileError) throw profileError;
+    const byId = new Map((profiles || []).map(profile => [profile.id, profile]));
+    const grouped = new Map();
+    requests.forEach(rel => {
+      const personId = rel.requester_id === userId ? rel.addressee_id : rel.requester_id;
+      if (!grouped.has(personId)) grouped.set(personId, []);
+      grouped.get(personId).push(rel);
+    });
+    friends = [...grouped.entries()].map(([personId, matches]) => ({ ...byId.get(personId), relation: preferredRelationship(matches, userId) })).filter(person => person.id);
+    await loadFriendsAndRequests();
+  }
+  window.openFriendsList = async function() {
     integrateDiscoverIntoFriends();
     const modal = document.getElementById('friendsModal');
     if (modal) { modal.style.display = 'grid'; modal.setAttribute('aria-hidden', 'false'); }
     const defaultTab = document.querySelector('#friendsModal [data-friend-tab="all"]');
     window.setFriendsTab('all', defaultTab);
+    try { await refreshFriendsFromDatabase(); } catch (error) { safeError(error, 'Could not refresh friends. Check your connection and friend-request permissions.'); }
   };
   integrateDiscoverIntoFriends();
 
   window.renderStoryViewer = renderLiveStoryViewer;
   window.stepStory = stepLiveStory;
-  window.handleYourStoryClick = () => { if (yourStories.length) openLiveStory({ owner: selfProfile, items: yourStories, isYours: true }); else { resetStoryComposer(); openModal('storyModal'); } };
+  window.handleYourStoryClick = async () => {
+    if (!window.surfCurrentUserId) return toast('Sign in to view or share a story.');
+    try { await loadStories(); } catch (error) { console.warn('Could not refresh stories before opening yours:', error); }
+    if (yourStories?.length) await openLiveStory({ owner: selfProfile, items: yourStories, isYours: true });
+    else { resetStoryComposer(); openModal('storyModal'); }
+  };
   window.openStoryViewers = openStoryViewers;
   window.toggleStoryLike = toggleStoryLike;
   window.openStoryArchive = openStoryArchive;
@@ -2470,6 +2523,26 @@
   document.getElementById('composer')?.querySelectorAll('input,button').forEach((item) => { item.disabled = true; });
   bindSearches();
   bindProfileImageUploads();
+  // Re-check persisted auth state after browser restores a page from cache or after a refresh.
+  let surfSessionRecheckBusy = false;
+  const recheckStoredSession = async () => {
+    if (surfSessionRecheckBusy || window.surfCurrentUserId || !db?.auth) return;
+    surfSessionRecheckBusy = true;
+    try {
+      const { data, error } = await db.auth.getSession();
+      if (error) throw error;
+      if (data?.session?.user) {
+        const authUser = data.session.user;
+        const profile = await window.loadSurfProfile(authUser);
+        window.enterApp(profile);
+        window.surfAppRestoredForUser = authUser.id;
+      }
+    } catch (error) { console.warn('Surf session recheck failed:', error); }
+    finally { surfSessionRecheckBusy = false; }
+  };
+  window.addEventListener('pageshow', recheckStoredSession);
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') recheckStoredSession(); });
+
   restoreSupabaseSession().catch((error) => {
     console.error('Could not restore Surf session:', error);
     const errorBox = document.getElementById('authError');
