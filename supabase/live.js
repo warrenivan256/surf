@@ -725,7 +725,7 @@
     } else if (state === 'received') {
       result = await db.from('friend_requests').update({ status: 'accepted', updated_at: new Date().toISOString() }).eq('id', match.id);
     } else if (state === 'accepted') {
-      if (!confirm(`Are you sure you want to unfriend ${activeProfile.display_name || activeProfile.username}?`)) return;
+      if (!(await window.surfConfirm({title:'Unfriend this person?',message:`You and ${activeProfile.display_name || activeProfile.username} will no longer be connected.`,confirmText:'Unfriend',danger:true}))) return;
       result = await db.from('friend_requests').delete().eq('id', match.id);
     }
     if (result?.error) return safeError(result.error, 'Could not update this connection.');
@@ -2150,7 +2150,7 @@
         if (error) return safeError(error, 'Could not unblock this user.');
         toast('Unblocked ' + label);
       } else {
-        if (!confirm('Block ' + label + '? They may no longer be able to interact with you.')) return;
+        if (!(await window.surfConfirm({title:'Block this person?',message:label+' may no longer be able to interact with you. You can unblock them later.',confirmText:'Block',danger:true}))) return;
         const { error } = await db.from('blocks').insert({ blocker_id: window.surfCurrentUserId, blocked_id: targetId });
         if (error) return safeError(error, 'Could not block this user.');
         toast('Blocked ' + label);
@@ -2165,7 +2165,7 @@
       if (outgoing.error || incoming.error) return safeError(outgoing.error || incoming.error, 'Could not load follow status.');
       if (!outgoing.data) return syncPageProfileMoreMenu(person);
       const mutual = !!incoming.data;
-      if (!confirm(mutual ? `Are you sure you want to unfriend ${label}? You will both stop following each other.` : `Are you sure you want to unfollow ${label}?`)) return;
+      if (!(await window.surfConfirm({title:mutual?'Unfriend this person?':'Unfollow this person?',message:mutual?`You and ${label} will stop following each other.`:`You will stop following ${label}.`,confirmText:mutual?'Unfriend':'Unfollow',danger:true}))) return;
       const first = await db.from('surf_follows').delete().eq('follower_id', window.surfCurrentUserId).eq('followed_id', targetId);
       if (first.error) return safeError(first.error, 'Could not update this relationship.');
       if (mutual) {
@@ -2220,8 +2220,8 @@
     const target = activeProfile?.id === targetId ? activeProfile : { id: targetId, username: document.getElementById('pageHandle')?.textContent || 'this user', display_name: document.getElementById('pageName')?.textContent || 'this user' };
     const label = target.display_name || target.username || 'this user';
     const { iFollow, followsMe } = pageFollowState;
-    if (iFollow && followsMe && !window.confirm(`Are you sure you want to unfriend ${label}? You will both stop following each other.`)) return;
-    if (iFollow && !followsMe && !window.confirm(`Unfollow ${label}?`)) return;
+    if (iFollow && followsMe && !(await window.surfConfirm({title:'Unfriend this person?',message:`You and ${label} will stop following each other.`,confirmText:'Unfriend',danger:true}))) return;
+    if (iFollow && !followsMe && !(await window.surfConfirm({title:'Unfollow this person?',message:`You will stop following ${label}.`,confirmText:'Unfollow',danger:true}))) return;
     pageFollowState.busy = true;
     renderPageFollowButton();
     let result;
@@ -2249,11 +2249,13 @@
     // directly inside onAuthStateChange (that can deadlock the auth lock).
     let restoringUserId = null;
     const restoreUser = async (authUser) => {
-      if (!authUser?.id || restoringUserId === authUser.id || window.surfCurrentUserId === authUser.id) return;
+      if (!authUser?.id || restoringUserId === authUser.id) return;
+      if (window.surfAppRestoredForUser === authUser.id) return;
       restoringUserId = authUser.id;
       try {
         const profile = await window.loadSurfProfile(authUser);
         window.enterApp(profile);
+        window.surfAppRestoredForUser = authUser.id;
       } catch (error) {
         // A profile-row/network error must not turn a valid Supabase session
         // into an apparent sign-out. Keep the authenticated user in the app
@@ -2269,6 +2271,7 @@
           bio: '', avatar_path: null, banner_path: null,
           dob: meta.date_of_birth || '', social_links: {}, email: authUser.email || ''
         });
+        window.surfAppRestoredForUser = authUser.id;
         const errorBox = document.getElementById('authError');
         if (errorBox) errorBox.textContent = 'You are still signed in, but your profile could not load. Check your connection and profile permissions.';
         toast('Signed in, but profile details could not load.');
@@ -2278,6 +2281,7 @@
       if (event === 'SIGNED_OUT') {
         restoringUserId = null;
         window.surfCurrentUserId = null;
+        window.surfAppRestoredForUser = null;
         window.surfActiveRecipientId = null;
         window.surfActiveGroupId = null;
         window.enterApp(null);
@@ -2286,11 +2290,18 @@
         queueMicrotask(() => restoreUser(session.user));
       }
     });
-    const { data, error } = await db.auth.getSession();
+    let { data, error } = await db.auth.getSession();
     if (error) throw error;
     if (data.session?.user) {
       await restoreUser(data.session.user);
+      return;
     }
+    // Some browsers can briefly report an empty session while auth storage is initializing.
+    // Retry once on the same configured project key; never erase or overwrite stored credentials.
+    await new Promise(resolve => setTimeout(resolve, 180));
+    const retry = await db.auth.getSession();
+    if (retry.error) throw retry.error;
+    if (retry.data.session?.user) await restoreUser(retry.data.session.user);
   }
 
   function integrateDiscoverIntoFriends() {
